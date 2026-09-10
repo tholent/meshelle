@@ -50,7 +50,7 @@ import logging
 import struct
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, field
 
 from meshelle.proto.constants import (
@@ -87,8 +87,13 @@ DEVICE_INFO_MIN_LEN = 60
 SELF_INFO_MIN_LEN = 58
 
 
-def _first_leaf(exc: BaseException) -> BaseException:
-    """The first non-group exception inside a possibly nested ExceptionGroup."""
+def first_leaf(exc: BaseException) -> BaseException:
+    """The first non-group exception inside a possibly nested ExceptionGroup.
+
+    Public because every supervisor in the process needs it: ``asyncio.TaskGroup``
+    wraps a child failure in an ``ExceptionGroup``, and an operator wants the
+    actionable error, not a group to unwrap.
+    """
     while isinstance(exc, BaseExceptionGroup):
         exc = exc.exceptions[0]
     return exc
@@ -303,8 +308,15 @@ class CompanionLink:
         )
         self._outbound_ready.set()
 
-    async def packets(self) -> AsyncIterator[ReceivedPacket]:
-        """Yield every packet the node hears, for as long as the link runs."""
+    async def packets(self) -> AsyncGenerator[ReceivedPacket]:
+        """Yield every packet the node hears, for as long as the link runs.
+
+        Typed as a generator, not just an iterator, because the caller has to
+        ``aclose()`` it at shutdown: an async generator left to the garbage
+        collector is reported as "async generator ignored GeneratorExit", which
+        this project's ``filterwarnings = ["error"]`` turns into a failure
+        attributed to whatever ran next.
+        """
         while True:
             yield await self._packets.get()
 
@@ -324,7 +336,7 @@ class CompanionLink:
                 # Reconnecting cannot conjure up a command the firmware lacks.
                 # Re-raise the leaf, not the group: callers want an actionable
                 # error, not an ExceptionGroup they have to unwrap.
-                raise _first_leaf(group) from None
+                raise first_leaf(group) from None
             except* (CompanionError, TransportError) as group:
                 for exc in group.exceptions:
                     logger.error("companion link failed: %s", exc)
@@ -362,7 +374,7 @@ class CompanionLink:
             await transport.connect()
             logger.info("connected to companion via %s", transport.description)
 
-            info = await self._handshake(transport)
+            info = await self.handshake(transport)
             self._state.info = info
             logger.info("companion: %s", info.summary())
             self._ready.set()
@@ -377,8 +389,12 @@ class CompanionLink:
                 await transport.close()
             self._transport = None
 
-    async def _handshake(self, transport: Transport) -> CompanionInfo:
+    async def handshake(self, transport: Transport) -> CompanionInfo:
         """Identify the node and learn its radio settings.
+
+        Public so ``meshelle doctor`` can identify a node over one connection it
+        opened itself, without starting the reconnect supervisor -- a diagnostic
+        that silently retried a bad port would report a symptom, not the fault.
 
         Bounded by :data:`HANDSHAKE_TIMEOUT` in total. meshcore-pi's equivalent
         does a bare ``readexactly(1)`` here, so a node that has stopped answering

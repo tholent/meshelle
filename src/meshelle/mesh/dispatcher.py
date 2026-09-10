@@ -135,6 +135,17 @@ class Dispatcher:
         for room in self._rooms:
             self._by_hash.setdefault(room.node_hash, []).append(room)
 
+    def add_room(self, room: RoomHandler) -> None:
+        """Attach a room after construction.
+
+        The two objects need each other: a room transmits through the
+        dispatcher, and the dispatcher routes to the room. One of them has to be
+        attachable afterwards, and it is this one -- a room handed a sink it
+        could not yet use would be a room whose first advert goes nowhere.
+        """
+        self._rooms.append(room)
+        self._by_hash.setdefault(room.node_hash, []).append(room)
+
     # -- transmit ------------------------------------------------------------
 
     async def send(
