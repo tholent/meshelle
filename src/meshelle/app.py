@@ -58,6 +58,7 @@ from typing import Any
 
 from meshelle import __version__
 from meshelle.companion.link import CompanionInfo, CompanionLink, first_leaf
+from meshelle.config.dotenv import DotenvError, DotenvResult, load_dotenv
 from meshelle.config.loader import ConfigError, load_settings
 from meshelle.config.model import (
     CompanionSettings,
@@ -226,6 +227,7 @@ class Application:
         *,
         config_path: Path | None = None,
         overrides: Mapping[str, Any] | None = None,
+        env_file: DotenvResult | None = None,
         transport_factory: Callable[[], Transport] | None = None,
         clock: Clock | None = None,
         timings: Timings | None = None,
@@ -235,6 +237,7 @@ class Application:
         self._settings = settings
         self._config_path = config_path
         self._overrides = dict(overrides) if overrides else {}
+        self._env_file = env_file if env_file is not None else DotenvResult()
         self._base = config_base(config_path)
         self._clock: Clock = clock if clock is not None else UniqueClock()
         self._timings = timings if timings is not None else Timings()
@@ -482,12 +485,29 @@ class Application:
 
         logger.info("reloading %s", self._config_path)
         try:
-            fresh = load_settings(self._config_path, overrides=self._overrides)
-        except ConfigError as exc:
+            env_file = self._reload_env_file()
+            fresh = load_settings(
+                self._config_path, overrides=self._overrides, env_sources=env_file.sources
+            )
+        except (ConfigError, DotenvError) as exc:
             logger.error("reload refused; keeping the running configuration:\n%s", exc)
             return
 
+        self._env_file = env_file
         self._adopt(fresh)
+
+    def _reload_env_file(self) -> DotenvResult:
+        """Re-read the env file, if there was one, before re-reading the config.
+
+        The variables this process took from the file last time are dropped
+        first, so a rotated password takes effect and a *deleted* line actually
+        revokes -- a value left behind in ``os.environ`` would keep an old
+        password working for the life of the process, which is precisely the
+        thing an operator reloads to stop.
+        """
+        if self._env_file.path is None:
+            return self._env_file
+        return load_dotenv(self._env_file.path, owned=self._env_file.applied)
 
     def _adopt(self, fresh: Settings) -> None:
         """Apply a validated configuration, naming everything it cannot change."""
