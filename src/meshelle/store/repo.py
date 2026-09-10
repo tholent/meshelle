@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import time
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from meshelle.proto.constants import OUT_PATH_UNKNOWN, Permission
@@ -192,18 +192,22 @@ def prune_posts(
 ) -> int:
     """Apply the retention policy, returning how many posts were removed.
 
+    The two policies are independent reasons to delete, combined with **OR**: a
+    post goes if it is too old *or* if it is past the count. Requiring both would
+    make ``max_posts`` a dead letter whenever ``post_retention`` is also set --
+    which it is by default -- so a busy room would grow without limit until its
+    posts aged out, and the documented "keep at most N" would never hold.
+
     Never prunes a post a connected client has not yet been sent: the minimum
-    ``sync_since`` across the room's clients is a floor on what can be deleted.
-    Dropping an unsynced post would silently lose a message for someone.
+    ``sync_since`` across the room's clients is a floor on what can be deleted,
+    and it is ANDed with everything else. Dropping an unsynced post would
+    silently lose a message for someone, which no retention policy is worth.
     """
     floor = session.scalar(select(func.min(Client.sync_since)).where(Client.room_id == room_id))
 
-    doomed = select(Post.id).where(Post.room_id == room_id)
-    conditions_applied = False
-
+    policies = []
     if older_than is not None:
-        doomed = doomed.where(Post.post_ts < older_than)
-        conditions_applied = True
+        policies.append(Post.post_ts < older_than)
 
     if keep_newest is not None:
         kept = (
@@ -212,11 +216,12 @@ def prune_posts(
             .order_by(Post.post_ts.desc())
             .limit(keep_newest)
         )
-        doomed = doomed.where(Post.id.not_in(kept))
-        conditions_applied = True
+        policies.append(Post.id.not_in(kept))
 
-    if not conditions_applied:
+    if not policies:
         return 0
+
+    doomed = select(Post.id).where(Post.room_id == room_id, or_(*policies))
 
     if floor is not None:
         doomed = doomed.where(Post.post_ts <= floor)
@@ -303,6 +308,23 @@ def advance_sync(session: Session, room_id: int, public_key: bytes, post_ts: int
             Client.sync_since < post_ts,
         )
         .values(sync_since=post_ts)
+    )
+
+
+def force_sync_since(session: Session, room_id: int, public_key: bytes, sync_since: int) -> None:
+    """Set a client's cursor to exactly what it asked for, backwards or not.
+
+    Deliberately not :func:`advance_sync`. That function's forward-only guard
+    exists to stop a *late ACK* undoing progress, which is a race. This is a
+    client explicitly saying "the newest post I hold is X" in a keep-alive
+    (MyMesh.cpp:557), and a client that has lost history is entitled to ask for
+    it again. Applying the forward-only guard here would make re-syncing after a
+    client-side restore impossible.
+    """
+    session.execute(
+        update(Client)
+        .where(Client.room_id == room_id, Client.public_key == public_key)
+        .values(sync_since=sync_since)
     )
 
 
