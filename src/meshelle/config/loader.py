@@ -33,7 +33,8 @@ import difflib
 import logging
 import os
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,7 @@ from meshelle.config.model import (
     RoomSettings,
     Settings,
 )
+from meshelle.config.source import KeyPath, SourceMap, build_source_map
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +151,36 @@ def env_overrides(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     return overrides
 
 
+def env_origins(environ: Mapping[str, str] | None = None) -> dict[KeyPath, str]:
+    """Which environment variable set each path.
+
+    Needed so an error about an overridden value names the variable instead of a
+    line in the file, which would send the reader to edit something that is not
+    actually in effect.
+    """
+    source = os.environ if environ is None else environ
+    origins: dict[KeyPath, str] = {}
+
+    for name, _value in source.items():
+        if not name.startswith(ENV_PREFIX) or name == ENV_PREFIX:
+            continue
+        path = tuple(part.lower() for part in name[len(ENV_PREFIX) :].split(ENV_NESTING) if part)
+        if path:
+            origins[path] = name
+
+    return origins
+
+
+def _leaf_paths(data: Mapping[str, Any], prefix: KeyPath = ()) -> Iterator[KeyPath]:
+    """Every path that carries an actual value, not an intermediate table."""
+    for key, value in data.items():
+        path = (*prefix, key)
+        if isinstance(value, Mapping):
+            yield from _leaf_paths(value, path)
+        else:
+            yield path
+
+
 def _rename_file_keys(raw: Mapping[str, Any]) -> dict[str, Any]:
     """Translate the file's spellings into the model's field names."""
     data = {key: value for key, value in raw.items() if key != FILE_ROOMS_KEY}
@@ -206,6 +238,19 @@ def _apply_implicit_names(data: dict[str, Any]) -> dict[str, Any]:
         for slug, room in rooms.items()
     }
     return data
+
+
+def _file_key_path(location: tuple[int | str, ...]) -> KeyPath:
+    """Convert a pydantic error location into the file's own key path."""
+    path: list[str | int] = []
+    for index, item in enumerate(location):
+        if index == 0 and item == "rooms":
+            path.append(FILE_ROOMS_KEY)
+        elif item == "members":
+            path.append(FILE_MEMBERS_KEY)
+        else:
+            path.append(item)
+    return tuple(path)
 
 
 def _display_path(location: tuple[int | str, ...]) -> str:
@@ -267,36 +312,93 @@ def _describe_unknown_key(location: tuple[int | str, ...]) -> str:
     return f"{prefix}. Valid keys here: {', '.join(display)}"
 
 
-def format_validation_error(error: ValidationError, source: str) -> str:
-    """Turn a pydantic error into operator-facing lines."""
-    lines = [f"{source}: configuration is invalid:"]
+def _origin_prefix(
+    location: tuple[int | str, ...],
+    source: str,
+    source_map: SourceMap | None,
+    origins: Mapping[KeyPath, str] | None,
+) -> str:
+    """Where to tell the operator to look.
+
+    An explicit override wins over the file: if the effective value came from an
+    environment variable or the command line, naming a file line would point at
+    something that is not in effect.
+    """
+    path = _file_key_path(location)
+
+    if origins:
+        for length in range(len(path), 0, -1):
+            origin = origins.get(path[:length])
+            if origin is not None:
+                return f"{origin}: "
+
+    if source_map is not None:
+        line = source_map.locate(path)
+        if line is not None:
+            return f"{source}:{line}: "
+
+    return f"{source}: "
+
+
+def format_validation_error(
+    error: ValidationError,
+    source: str,
+    *,
+    source_map: SourceMap | None = None,
+    origins: Mapping[KeyPath, str] | None = None,
+) -> str:
+    """Turn a pydantic error into operator-facing lines.
+
+    Each line is prefixed ``file:line:`` so an editor can jump straight to it, or
+    with the name of the environment variable or flag that supplied the value.
+    """
+    lines = ["configuration is invalid:"]
     for detail in error.errors():
         location = detail["loc"]
+        prefix = _origin_prefix(location, source, source_map, origins)
+
         if detail["type"] == "extra_forbidden":
-            lines.append(f"  - {_describe_unknown_key(location)}")
+            lines.append(f"  - {prefix}{_describe_unknown_key(location)}")
             continue
 
-        message = detail["msg"]
         # Pydantic prefixes messages raised by our own validators.
-        message = message.removeprefix("Value error, ")
+        message = detail["msg"].removeprefix("Value error, ")
         where = _display_path(location)
-        lines.append(f"  - {where}: {message}" if where else f"  - {message}")
+        lines.append(f"  - {prefix}{where}: {message}" if where else f"  - {prefix}{message}")
     return "\n".join(lines)
 
 
-def read_config_file(path: Path) -> dict[str, Any]:
-    """Parse a TOML config file into a raw dict."""
+@dataclass(frozen=True, slots=True)
+class ConfigFile:
+    """A parsed config file, keeping the text so errors can cite line numbers."""
+
+    path: Path
+    text: str
+    data: dict[str, Any]
+
+    @property
+    def source_map(self) -> SourceMap:
+        return build_source_map(self.text)
+
+
+def read_config_file(path: Path) -> ConfigFile:
+    """Parse a TOML config file, retaining its text for diagnostics."""
     try:
         raw = path.read_bytes()
     except OSError as exc:
         raise ConfigError(f"cannot read config file {path}: {exc}") from exc
 
     try:
-        return tomllib.loads(raw.decode("utf-8"))
-    except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(f"{path} is not valid TOML: {exc}") from exc
+        text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ConfigError(f"{path} is not valid UTF-8: {exc}") from exc
+
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{path} is not valid TOML: {exc}") from exc
+
+    return ConfigFile(path=path, text=text, data=data)
 
 
 def build_settings(
@@ -305,6 +407,7 @@ def build_settings(
     environ: Mapping[str, str] | None = None,
     overrides: Mapping[str, Any] | None = None,
     source: str = "configuration",
+    source_map: SourceMap | None = None,
 ) -> Settings:
     """Merge every layer and validate, in precedence order.
 
@@ -313,11 +416,17 @@ def build_settings(
         environ: environment to read ``MESHELLE_`` variables from.
         overrides: highest-precedence values, normally assembled from CLI flags.
         source: what to name in error messages, usually the config file path.
+        source_map: line numbers for the config file, so errors can cite them.
     """
     merged: dict[str, Any] = dict(file_data or {})
     merged = deep_merge(merged, env_overrides(environ))
+
+    origins: dict[KeyPath, str] = dict(env_origins(environ))
     if overrides:
         merged = deep_merge(merged, overrides)
+        # Flags are the highest layer, so they win the blame too.
+        for path in _leaf_paths(overrides):
+            origins[path] = "command line"
 
     merged = _rename_file_keys(merged)
     merged = _apply_room_defaults(merged)
@@ -326,7 +435,9 @@ def build_settings(
     try:
         return Settings.model_validate(merged)
     except ValidationError as exc:
-        raise ConfigError(format_validation_error(exc, source)) from exc
+        raise ConfigError(
+            format_validation_error(exc, source, source_map=source_map, origins=origins)
+        ) from exc
 
 
 def load_settings(
@@ -336,10 +447,11 @@ def load_settings(
     overrides: Mapping[str, Any] | None = None,
 ) -> Settings:
     """Load configuration from ``path``, then environment, then ``overrides``."""
-    file_data = read_config_file(path) if path is not None else {}
+    config_file = read_config_file(path) if path is not None else None
     return build_settings(
-        file_data,
+        config_file.data if config_file is not None else {},
         environ=environ,
         overrides=overrides,
         source=str(path) if path is not None else "configuration",
+        source_map=config_file.source_map if config_file is not None else None,
     )
