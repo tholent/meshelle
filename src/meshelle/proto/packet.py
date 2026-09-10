@@ -45,9 +45,11 @@ from typing import Self
 
 from meshelle.proto import crypto
 from meshelle.proto.constants import (
+    CIPHER_BLOCK_SIZE,
     CIPHER_MAC_SIZE,
     MAX_PACKET_PAYLOAD,
     MAX_PATH_SIZE,
+    MAX_RAW_TX_PACKET,
     PATH_HASH_SIZE_MASK,
     PATH_HASH_SIZE_SHIFT,
     PATH_HOP_COUNT_MASK,
@@ -76,6 +78,29 @@ MAX_PATH_HASH_SIZE = 3
 
 class PacketError(Exception):
     """A packet or payload could not be decoded."""
+
+
+def max_plaintext_len(path_bytes: int = MAX_PATH_SIZE) -> int:
+    """Largest plaintext a datagram can carry over a ``path_bytes``-long path.
+
+    The binding limit is not :data:`MAX_PACKET_PAYLOAD` (184) but the companion
+    node's frame buffer: an outbound ``CMD_SEND_RAW_PACKET`` frame caps the raw
+    packet at :data:`MAX_RAW_TX_PACKET` (174) bytes. Firmware never notices,
+    because it hands packets to its own radio driver instead of over a serial
+    link, so a length that firmware accepts can still be untransmittable here.
+
+    Working inwards from the 174 bytes: a header and a path-length byte, the
+    path itself, the destination and source hashes, the 2-byte MAC, and then the
+    ciphertext -- which is a whole number of cipher blocks, so the answer is
+    rounded down to a block boundary.
+
+    Passing the worst case (a full 64-byte path) gives a length that is safe to
+    send to any client by any route.
+    """
+    budget = MAX_RAW_TX_PACKET - 2 - path_bytes - Datagram.HEADER_LEN - CIPHER_MAC_SIZE
+    if budget < CIPHER_BLOCK_SIZE:
+        return 0
+    return (budget // CIPHER_BLOCK_SIZE) * CIPHER_BLOCK_SIZE
 
 
 def _c_string(data: bytes, offset: int = 0) -> bytes:
@@ -330,11 +355,20 @@ class TextMessage:
             txt_type = TxtType(txt_type_raw)
         except ValueError as exc:
             raise PacketError(f"unsupported text type 0x{txt_type_raw:02X}") from exc
+        # A SIGNED_PLAIN message is trimmed from *after* the author's key
+        # prefix: firmware's client half does `strlen(&data[9])`
+        # (BaseChatMesh.cpp:273), not `strlen(&data[5])`. The prefix is raw key
+        # bytes, so one of them being zero is ordinary -- scanning from offset 5
+        # would truncate such a message to nothing and compute an ACK the sender
+        # never expects, making every post from that author un-syncable.
+        body_offset = cls.PREFIX_LEN
+        if txt_type is TxtType.SIGNED_PLAIN:
+            body_offset += SIGNED_AUTHOR_PREFIX_LEN
         return cls(
             timestamp=timestamp,
             txt_type=txt_type,
             attempt=flags & TXT_ATTEMPT_MASK,
-            text=_c_string(plaintext, cls.PREFIX_LEN),
+            text=plaintext[cls.PREFIX_LEN : body_offset] + _c_string(plaintext, body_offset),
         )
 
     @property
