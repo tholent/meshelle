@@ -4,7 +4,7 @@ Read this first. It carries the context that is **expensive to re-derive** and t
 decisions that should **not be relitigated**. Everything else is in the code, which
 is heavily commented on purpose — the *why* lives next to the *what*.
 
-Last updated: Phase 6 complete (2026-09-10).
+Last updated: Phase 7 complete (2026-09-10).
 
 ---
 
@@ -37,12 +37,12 @@ documented spelling the code does not read.
 | | |
 |---|---|
 | Branch | `main` (was `master`; renamed, no remote) |
-| Commits | 37, conventional commits |
-| Tests | **802 passing**, ~16s |
-| Coverage | **94%** overall |
+| Commits | 42, conventional commits |
+| Tests | **887 passing**, ~13s |
+| Coverage | **96%** overall |
 | Gate | ruff + ruff format + mypy strict all clean |
 
-**Phases 1–6 are done and committed.** Phases 7–8 remain.
+**Phases 1–7 are done and committed.** Phase 8 remains.
 
 ```
 ✅ 1  toolchain + Apache-2.0 licensing
@@ -51,13 +51,13 @@ documented spelling the code does not read.
 ✅ 4  store/      SQLAlchemy models, Alembic, repositories       (1071 lines, 91-100%)
 ✅ 5  config/     strict schema, loader, line-number diagnostics (1104 lines, 96-98%)
 ✅ 6  mesh/ + room/   the room server itself           (1650 lines, 95-100%)
-⬜ 7  app.py + cli.py  wiring, signals, subcommands      ← NEXT
-⬜ 8  docs         README, config.example.toml, PROTOCOL-NOTES.md
+✅ 7  app.py + cli.py + logs.py + paths.py  the wiring   (560 lines, 97-100%)
+⬜ 8  docs         README, config.example.toml, PROTOCOL-NOTES.md  ← NEXT
 ```
 
-`cli.py` still does `--version` and nothing else, and there is no `app.py`: that
-is Phase 7 work, not an oversight. Nothing constructs a `Dispatcher` or a
-`RoomServer` yet — Phase 6 built and tested the parts, Phase 7 wires them up.
+Everything runs. `meshelle run` hosts the configured rooms; `check-config`,
+`keygen`, `doctor` and `db` are all implemented. What is left is documentation
+and the on-hardware verification in §10, which no unit test can stand in for.
 
 ---
 
@@ -172,6 +172,28 @@ source file. The highest-value files in the firmware repo:
   injected clock but sleeps on the real one measures one timeline and waits on
   another; it also makes every interval test cost its own interval. Tests now run
   the room against its **real** protocol delays for free.
+- **Relative paths in the config are relative to the config *file*.** Not to the
+  working directory: a systemd unit runs with `WorkingDirectory=/`, so the same
+  file would give the service `/data` and the operator `./data` — two databases,
+  one config. One rule in `paths.py`, used by the database, the key files and
+  the log file alike.
+- **Logging always goes to stderr; a file sink is additional.** meshcore-pi's
+  `basicConfig(filename=...)` redirects everything, so raising the log level
+  looks like it does nothing and a service start looks silent.
+- **A SIGHUP reload is all-or-nothing, and only re-resolves what can change.**
+  An invalid file is refused whole, keeping the running configuration — losing
+  a room's ACL to a typo in an unrelated section is the worst outcome of a
+  routine edit. Companion settings, `data_dir`, added rooms and changed room
+  identities are *named* as needing a restart rather than silently ignored; a
+  removed room keeps running, because dropping it mid-sync would abandon what
+  it still owes its clients.
+- **Diagnostics create nothing.** `check-config` and `doctor` never generate a
+  key file and never migrate; a command asked what is missing must not make it
+  stop being missing. Only `run` creates state, and it logs a generated room
+  identity at WARNING.
+- **`Dispatcher.add_room` exists because the wiring is circular.** A room
+  transmits through the dispatcher and the dispatcher routes to the room; one
+  of them has to be attachable after construction.
 - **Clients are rehydrated from the database at startup, but a password-earned
   role is not.** The password is never recorded, so a restart cannot re-verify it
   — restoring the role anyway would mean removing a password from the config
@@ -256,7 +278,7 @@ source file. The highest-value files in the firmware repo:
 
 ---
 
-## 7. What the finished layers give Phase 7
+## 7. What each layer gives its callers
 
 `proto/` — pure functions and frozen dataclasses, no I/O:
 
@@ -335,34 +357,74 @@ tests/fakes/room.py    ManualClock, CapturingSink, `drain`
 a host running this), and `ADVERT` handling (a room learns a client's key from
 the login itself, so it keeps no contact book).
 
-## 9. Phases 7–8
+## 9. Phase 7 — app + CLI (done)
 
-**7 — app + CLI:** nothing constructs the Phase 6 objects yet. The wiring is:
-one `Store`, one `CompanionLink`, one `SeenTable`/`RadioStats`, one `Scheduler`,
-one `UniqueClock`, and one `RoomServer` per configured room, all handed to a
-single `Dispatcher`, with `dispatcher.run(link.packets())` plus each room's
-`run_push_loop()` and `run_advert_loop()` under one `TaskGroup` (see trap #1).
-`RoomServer.start()` must run before the loops; `RoomServer.apply_settings()` is
-the SIGHUP path. `asyncio.TaskGroup` supervision, `upgrade_to_head` at startup,
-SIGHUP reload (re-resolve roles; keep sync cursors), SIGTERM graceful shutdown,
-stderr logging. Subcommands: `run`, `check-config`, `keygen`, `doctor`, `db`.
-`doctor` should use `probe_raw_packet_support` and report the node's identity.
+```
+paths.py     one rule for resolving a relative config path            100%
+logs.py      stderr always, optional file, text or JSON, idempotent    97%
+app.py       identities, wiring, TaskGroup supervision, signals        99%
+cli.py       run / check-config / keygen / doctor / db                 97%
+```
 
-**8 — docs:** README (credit meshcore-pi as prior art), `config.example.toml`,
-`docs/PROTOCOL-NOTES.md` recording byte layouts with firmware line references, and
-a record of dependency licences.
+The shape, and why it is that shape:
 
----
+- **One of everything the node owns, one `RoomServer` per room.** One `Store`,
+  one `CompanionLink`, one `SeenTable`, one `RadioStats`, one `Scheduler`, one
+  `UniqueClock` — all shared — behind a single `Dispatcher`. A per-room
+  seen-table would let one room reprocess a packet another room's reply had
+  already put on the air.
+- **`RoomServer.start()` runs before the loops.** A push loop that started first
+  would see no sessions and idle while owed posts sat unsent.
+- **`link.packets()` is held, not passed inline**, so shutdown can `aclose()` it.
+  A garbage-collected async generator is reported as "async generator ignored
+  GeneratorExit" and, under `filterwarnings = ["error"]`, fails unrelated code.
+- **`_identify_node` refuses to share the companion's key** (trap #12). The
+  config cannot catch this: the node's key is only known once it has answered.
+- **`plan_rooms` catches identity collisions the config validator cannot** — a
+  default `<slug>.key` colliding with another room's explicit `key_file`, or a
+  seed and its expanded form given to two rooms as different-looking strings.
+- **Shutdown cancels the children explicitly.** `TaskGroup` ignores a child it
+  sees as cancelled, so the body cancels each task after `link.stop()`; the
+  failure path uses `except*` and `first_leaf` (trap #1).
+- `CompanionLink._handshake` and `_first_leaf` are now public (`handshake`,
+  `first_leaf`) — `doctor` drives one connection itself rather than starting the
+  reconnect supervisor, which would report a timeout instead of the real error.
 
-## 10. Verification on real hardware
+CLI surface:
+
+```bash
+meshelle run          -c room.toml [--log-level debug] [--log-format json]
+meshelle check-config -c room.toml     # valid? and what does it actually say
+meshelle keygen       -c room.toml [--room lobby] [--force]
+meshelle doctor       -c room.toml     # probes CMD 65 without transmitting
+meshelle db           current | upgrade | downgrade REV
+```
+
+Config is found at `--config`, then `$MESHELLE_CONFIG`, then `./meshelle.toml`,
+then `/etc/meshelle/meshelle.toml`. Exit codes: 0 fine, 1 meshelle cannot
+proceed (message on stderr, never a traceback), 2 bad invocation.
+
+Signals: `SIGTERM`/`SIGINT` stop; `SIGHUP` reloads. Both are exercised for real
+in `tests/test_app.py::TestSignals` — raised at the process — because a test
+that called `request_stop()` directly would pass with no handler installed at
+all, and the first `systemctl reload` would be what found out.
+
+## 10. Phase 8 — docs
+
+README (credit meshcore-pi as prior art), `config.example.toml`,
+`docs/PROTOCOL-NOTES.md` recording byte layouts with firmware line references,
+and a record of dependency licences. A systemd unit file is worth including now
+that `SIGHUP` and `SIGTERM` both mean something.
+
+## 11. Verification on real hardware
 
 Unit tests cannot prove the thing works on the air. The end-to-end sequence:
 
 ```bash
-uv run meshelle keygen --room lobby
+uv run meshelle keygen       --config room.toml --room lobby
 uv run meshelle check-config --config room.toml
-uv run meshelle doctor --config room.toml     # probes CMD 65, reports the node
-uv run meshelle run --config room.toml --log-level debug
+uv run meshelle doctor       --config room.toml   # probes CMD 65, reports the node
+uv run meshelle run          --config room.toml --log-level debug
 ```
 
 1. The room advert appears in the MeshCore app; add it as a contact.
@@ -374,7 +436,7 @@ uv run meshelle run --config room.toml --log-level debug
 
 ---
 
-## 11. Outstanding / optional
+## 12. Outstanding / optional
 
 - Four upstream bug reports worth filing against `meshcore-pi`: the config key
   mismatch, the startup advert race, the missing device-query timeout, and the
@@ -388,4 +450,8 @@ uv run meshelle run --config room.toml --log-level debug
   worth reporting, that is where they go.
 - The approved plan file (`~/.claude/plans/eventual-questing-whistle.md`) is
   gone; this document is the plan now.
+- `meshelle run` cannot add or remove a *room* on SIGHUP, only re-resolve the
+  ones already running. Doing it live would mean creating a `RoomServer` and
+  attaching it to a `Dispatcher` mid-flight, and tearing one down without
+  abandoning what it owes its clients. A restart is cheap; this is not.
 - If you want this file auto-loaded each run, reference it from a `CLAUDE.md`.
