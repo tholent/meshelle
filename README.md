@@ -66,6 +66,7 @@ cp config.example.toml meshelle.toml
 $EDITOR meshelle.toml            # at minimum: companion.port, and the rooms
                                  # you actually want
 export LOBBY_ADMIN_PW=…          # the example uses env: for its passwords
+                                 # (or put it in a .env -- see Secrets below)
 
 meshelle check-config -c meshelle.toml         # valid? and what does it say
 meshelle keygen       -c meshelle.toml         # give each room an identity
@@ -91,7 +92,7 @@ then `/etc/meshelle/meshelle.toml`.
 | `meshelle db upgrade` | migrate (`run` does this automatically) |
 | `meshelle db downgrade REV` | roll back |
 
-Every command takes `-c/--config`, `--log-level` and `--log-format`.
+Every command takes `-c/--config`, `--env-file`, `--log-level` and `--log-format`.
 Exit codes: `0` fine, `1` meshelle cannot proceed, `2` bad invocation.
 
 **Diagnostics create nothing.** `check-config` and `doctor` never generate a
@@ -146,6 +147,43 @@ who still knows the admin password.
 A systemd unit runs with `WorkingDirectory=/`, and one config file resolving to
 two different databases is not a useful surprise.
 
+### Secrets and the env file
+
+Passwords do not belong in the config file. `env:NAME` reads one from the
+environment and `file:/path` from a file, and neither ever appears in a
+`check-config` dump.
+
+Under systemd, `EnvironmentFile=` is the natural place to put those variables.
+Everywhere else there is `--env-file`:
+
+```bash
+printf 'LOBBY_ADMIN_PW=hunter2\n' > .env
+chmod 600 .env
+meshelle run -c meshelle.toml
+```
+
+It is found at `--env-file`, then `$MESHELLE_ENV_FILE`, then `.env` **beside the
+config file** — never the working directory, for the same reason relative paths
+are not: a service runs with `WorkingDirectory=/`, and a password that works
+only when you test by hand is a bad afternoon.
+
+A file named with `--env-file` or `$MESHELLE_ENV_FILE` must exist; a default
+`.env` need not. `check-config` and `doctor` both say which file was read and
+how many variables came out of it, and warn if it is group- or world-readable.
+
+The format is the familiar one, with three deliberate differences:
+
+- **The real environment wins.** `MESHELLE_LOG__LEVEL=debug meshelle run` is not
+  undone by a stale `.env` next to the config.
+- **No interpolation.** `$` and `${}` are literal, because passwords contain `$`
+  far more often than a `.env` wants substitution.
+- **Nothing is skipped silently.** A malformed line, or the same name twice, is
+  an error citing the line number. A password that never got set is the same
+  outage either way; only one of them tells you.
+
+`export NAME=value`, `#` comments, and single-, double- and multi-line quoted
+values all work as expected. Single quotes are literal, as in a shell.
+
 ### Roles
 
 | Role | Wire value | Can post | Notes |
@@ -168,7 +206,10 @@ sudo systemctl enable --now meshelle
 `systemctl reload meshelle` sends `SIGHUP`: the config is re-read and every
 ACL re-resolved **without dropping a single client's sync position**. A config
 that fails to validate is refused whole and the running one is kept, so a typo
-in one section cannot cost a room its ACL. Adding or removing a *room* still
+in one section cannot cost a room its ACL. The env file is re-read first, and
+the variables the last read supplied are dropped before it — so a rotated
+password takes effect and a *deleted* line actually revokes, rather than
+staying live for as long as the process runs. Adding or removing a *room* still
 needs a restart, and is logged as such rather than silently ignored.
 
 ## The over-the-air console

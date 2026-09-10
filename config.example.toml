@@ -128,7 +128,8 @@ read_write = "env:LOBBY_WRITE_PW"
 #
 # An unset variable is a startup error naming the variable, not a room that
 # quietly has no admin password. Set them where the service can see them —
-# systemd's EnvironmentFile=, or an exported shell variable for a manual run.
+# systemd's EnvironmentFile=, or a .env file beside this one (chmod 600),
+# which meshelle reads automatically. --env-file names a different one.
 
 
 # --- Members -----------------------------------------------------------------

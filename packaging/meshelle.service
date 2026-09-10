@@ -32,6 +32,11 @@ ExecReload=/bin/kill -HUP $MAINPID
 # Passwords written as env:NAME in the config are read from here. Keep it
 # mode 0600 and owned by root, so the config file itself carries no secrets.
 # EnvironmentFile=-/etc/meshelle/secrets.env
+#
+# meshelle also reads /etc/meshelle/.env on its own -- beside the config, not
+# in WorkingDirectory -- and `systemctl reload` re-reads it, dropping what the
+# last read had set so a deleted line actually revokes. Variables set here win
+# over that file, so this stays the authority when both exist.
 
 # meshelle logs to stderr; journald captures it. Set log.format = "json" in the
 # config if you ship the journal somewhere that parses it.
