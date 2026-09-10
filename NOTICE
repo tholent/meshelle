@@ -1,0 +1,30 @@
+meshelle
+Copyright 2026 Chris Wells
+
+This product includes software developed at the meshelle project
+(https://github.com/cwlls/meshelle).
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file for the
+full license text.
+
+----------------------------------------------------------------------------
+Prior art and acknowledgements
+----------------------------------------------------------------------------
+
+meshelle contains no third-party source code. The following projects are
+acknowledged as references used while implementing the MeshCore protocol; no
+code from either is included, vendored, or linked, and neither imposes any
+attribution requirement here.
+
+  MeshCore (https://github.com/meshcore-dev/MeshCore)
+    Copyright (c) 2025 Scott Powell / rippleradios.com
+    MIT License
+    The authoritative reference for the MeshCore wire protocol, packet and
+    payload formats, and room server behaviour.
+
+  meshcore-pi (https://github.com/brianwiddas/meshcore-pi)
+    Copyright (c) 2025 Brian Widdas
+    MIT License
+    Source of the architectural insight that a stock MeshCore companion node
+    can be driven as a bare radio modem, and of documentation on MeshCore's
+    expanded Ed25519 private key format.
