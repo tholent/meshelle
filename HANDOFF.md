@@ -215,33 +215,37 @@ source file. The highest-value files in the firmware repo:
 
 ## 7. What the finished layers give Phase 6
 
-```python
-# proto/ — all pure functions and frozen dataclasses, no I/O
-from meshelle.proto.identity import LocalIdentity, load_or_create_identity
-from meshelle.proto.packet import Packet, Datagram, AnonRequest, TextMessage, \
-     LoginRequest, ServerRequest, PathReturn, Ack
-from meshelle.proto.advert import Advert, AdvertData
-from meshelle.proto.crypto import DecryptionError, ack_hash, packet_hash
-from meshelle.proto.text import utf8_split, utf8_truncate
+`proto/` — pure functions and frozen dataclasses, no I/O:
 
+- `identity`: `LocalIdentity`, `load_or_create_identity`, `verify_signature`
+- `packet`: `Packet`, `Datagram`, `AnonRequest`, `TextMessage`, `LoginRequest`,
+  `ServerRequest`, `PathReturn`, `Ack`
+- `advert`: `Advert`, `AdvertData`
+- `crypto`: `DecryptionError`, `ack_hash`, `packet_hash`
+- `text`: `utf8_split`, `utf8_truncate`
+
+```python
 # companion/ — already handles reconnect, queueing, heartbeat
 link = CompanionLink(lambda: SerialTransport(port))
 asyncio.create_task(link.run())
-info = await link.wait_ready()                  # bound with asyncio.timeout
+info = await link.wait_ready()  # bound it with asyncio.timeout
 await link.send_packet(raw, priority=0, ttl=..., description="lobby advert")
-async for received in link.packets():           # ReceivedPacket(raw, snr, rssi)
+async for received in link.packets():  # ReceivedPacket(raw, snr, rssi)
     ...
 
 # store/ — repo functions are sync, dispatched to the DB thread
 post = await store.run(lambda s: repo.add_post(s, room_id, author, text, ts))
-owed = await store.run(lambda s: repo.next_unsynced_post(
-    s, room_id, client_key, since, not_newer_than=now - POST_SYNC_DELAY_SECS))
+owed = await store.run(
+    lambda s: repo.next_unsynced_post(
+        s, room_id, client_key, since, not_newer_than=now - POST_SYNC_DELAY_SECS
+    )
+)
 
 # config/
 settings = load_settings(path, overrides=cli_overrides)
-room.role_for_member(pubkey)     # -> Role | None
-room.passwords.as_pairs()        # -> [(Role, SecretStr)], strongest first
-room.allow_unknown.role          # -> Role | None  (None == reject silently)
+room.role_for_member(pubkey)  # -> Role | None
+room.passwords.as_pairs()  # -> [(Role, SecretStr)], strongest first
+room.allow_unknown.role  # -> Role | None  (None == reject silently)
 ```
 
 Repository semantics already enforced, so Phase 6 must not re-implement them:
