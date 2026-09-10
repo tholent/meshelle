@@ -4,7 +4,7 @@ Read this first. It carries the context that is **expensive to re-derive** and t
 decisions that should **not be relitigated**. Everything else is in the code, which
 is heavily commented on purpose — the *why* lives next to the *what*.
 
-Last updated: Phase 5 complete (2026-09-10).
+Last updated: Phase 6 complete (2026-09-10).
 
 ---
 
@@ -37,12 +37,12 @@ documented spelling the code does not read.
 | | |
 |---|---|
 | Branch | `main` (was `master`; renamed, no remote) |
-| Commits | 24, conventional commits |
-| Tests | **607 passing**, ~6s |
-| Coverage | **93%** overall |
+| Commits | 37, conventional commits |
+| Tests | **802 passing**, ~16s |
+| Coverage | **94%** overall |
 | Gate | ruff + ruff format + mypy strict all clean |
 
-**Phases 1–5 are done and committed.** Phases 6–8 remain.
+**Phases 1–6 are done and committed.** Phases 7–8 remain.
 
 ```
 ✅ 1  toolchain + Apache-2.0 licensing
@@ -50,14 +50,14 @@ documented spelling the code does not read.
 ✅ 3  transport/  framing, serial/TCP/BLE, companion link        (1195 lines, 55-100%)
 ✅ 4  store/      SQLAlchemy models, Alembic, repositories       (1071 lines, 91-100%)
 ✅ 5  config/     strict schema, loader, line-number diagnostics (1104 lines, 96-98%)
-⬜ 6  mesh/ + room/   the room server itself            ← NEXT, and the biggest
-⬜ 7  app.py + cli.py  wiring, signals, subcommands
+✅ 6  mesh/ + room/   the room server itself           (1650 lines, 95-100%)
+⬜ 7  app.py + cli.py  wiring, signals, subcommands      ← NEXT
 ⬜ 8  docs         README, config.example.toml, PROTOCOL-NOTES.md
 ```
 
-`src/meshelle/mesh/` and `src/meshelle/room/` contain only licensed `__init__.py`
-stubs. `cli.py` does `--version` and nothing else. Those are Phase 6/7 work, not
-oversights.
+`cli.py` still does `--version` and nothing else, and there is no `app.py`: that
+is Phase 7 work, not an oversight. Nothing constructs a `Dispatcher` or a
+`RoomServer` yet — Phase 6 built and tested the parts, Phase 7 wires them up.
 
 ---
 
@@ -161,6 +161,23 @@ source file. The highest-value files in the firmware repo:
   `PERM_ACL_GUEST`, so it lets a "read only" client post
   (`simple_room_server/MyMesh.cpp:480`). meshelle honours the name; the wire byte
   is still `1` so apps label it correctly.
+- **A member's declared role wins over any password.** Firmware consults its ACL
+  only when the password field is blank (`MyMesh.cpp:337`), so a demoted member
+  who still knows the admin password stays an admin. meshelle checks the member
+  list first, which is what makes a demotion in the config actually demote.
+- **Flooded replies go out un-scoped**, not with the request's transport codes
+  mirrored. See trap #10 — mirroring them is worse than sending none.
+- **Waiting is part of the `Clock` interface.** Both room loops and the scheduler
+  wait via `clock.sleep`, never `asyncio.sleep` directly. A loop that reads an
+  injected clock but sleeps on the real one measures one timeline and waits on
+  another; it also makes every interval test cost its own interval. Tests now run
+  the room against its **real** protocol delays for free.
+- **Clients are rehydrated from the database at startup, but a password-earned
+  role is not.** The password is never recorded, so a restart cannot re-verify it
+  — restoring the role anyway would mean removing a password from the config
+  achieved nothing until every client happened to log in again. Rehydrated
+  strangers get `Role.GUEST` and must log in again before they can post; their
+  owed posts still get pushed, which is what the restart case needs.
 
 ---
 
@@ -205,7 +222,33 @@ source file. The highest-value files in the firmware repo:
    `CONTACTS_FULL` at us. Ignored by design; operator docs should suggest
    `manual_add_contacts`.
 
-9. **Never share a key between two rooms, or with the companion node.** Two state
+9. **Mirroring transport codes on a flooded reply gets it dropped.** A transport
+   code is an HMAC over *that packet's own payload*, keyed by a region key
+   (`TransportKeyStore.cpp:4`). Our reply has a different payload, so a mirrored
+   code matches no region, and a repeater's `allowPacketForward` drops any flood
+   whose region resolved to NULL (`simple_repeater/MyMesh.cpp:440`). An un-scoped
+   `ROUTE_TYPE_FLOOD` reply resolves to the wildcard region instead and is
+   forwarded. meshelle has no region key configured, so `chooseReplyScope` would
+   return `REPLY_SCOPE_NONE` for it in every case — which is what it does.
+   *If* scoped replies are ever wanted, the config needs a region transport key;
+   there is no way to fake one. (An earlier draft of this document said to mirror
+   the codes. It was wrong.)
+
+10. **A `SIGNED_PLAIN` message is trimmed from offset 9, not 5.** The 4-byte
+   author key prefix sits between the flags byte and the text, and a public key
+   often contains a zero byte. Firmware's client scans from `&data[9]`
+   (`BaseChatMesh.cpp:273`). Scanning from 5 truncates such a message to nothing
+   *and* computes an ACK the room never expects, so that author's posts can never
+   be synced to anyone. Fixed in `TextMessage.decode`; pinned by a test.
+
+11. **Retention policies are OR, not AND.** `post_retention` and `max_posts` are
+   independent reasons to delete. ANDing them (as `prune_posts` originally did)
+   makes `max_posts` a dead letter whenever a retention age is also set — which
+   it is by default — so a busy room grows past its declared cap. The sync floor
+   is still ANDed: a post no client has been sent is never deleted, so a strict
+   `max_posts` legitimately does nothing while someone is behind.
+
+12. **Never share a key between two rooms, or with the companion node.** Two state
    machines answering one destination hash produce conflicting replies, duplicate
    ACKs, and mutually-overwriting sync cursors. Config validates this. (The
    companion's key *is* extractable via `CMD_EXPORT_PRIVATE_KEY`, enabled in the
@@ -213,13 +256,13 @@ source file. The highest-value files in the firmware repo:
 
 ---
 
-## 7. What the finished layers give Phase 6
+## 7. What the finished layers give Phase 7
 
 `proto/` — pure functions and frozen dataclasses, no I/O:
 
 - `identity`: `LocalIdentity`, `load_or_create_identity`, `verify_signature`
 - `packet`: `Packet`, `Datagram`, `AnonRequest`, `TextMessage`, `LoginRequest`,
-  `ServerRequest`, `PathReturn`, `Ack`
+  `ServerRequest`, `PathReturn`, `Ack`, `max_plaintext_len`
 - `advert`: `Advert`, `AdvertData`
 - `crypto`: `DecryptionError`, `ack_hash`, `packet_hash`
 - `text`: `utf8_split`, `utf8_truncate`
@@ -229,96 +272,78 @@ source file. The highest-value files in the firmware repo:
 link = CompanionLink(lambda: SerialTransport(port))
 asyncio.create_task(link.run())
 info = await link.wait_ready()  # bound it with asyncio.timeout
-await link.send_packet(raw, priority=0, ttl=..., description="lobby advert")
-async for received in link.packets():  # ReceivedPacket(raw, snr, rssi)
-    ...
 
 # store/ — repo functions are sync, dispatched to the DB thread
 post = await store.run(lambda s: repo.add_post(s, room_id, author, text, ts))
-owed = await store.run(
-    lambda s: repo.next_unsynced_post(
-        s, room_id, client_key, since, not_newer_than=now - POST_SYNC_DELAY_SECS
-    )
-)
 
 # config/
 settings = load_settings(path, overrides=cli_overrides)
 room.role_for_member(pubkey)  # -> Role | None
-room.passwords.as_pairs()  # -> [(Role, SecretStr)], strongest first
-room.allow_unknown.role  # -> Role | None  (None == reject silently)
 ```
 
-Repository semantics already enforced, so Phase 6 must not re-implement them:
-`sync_since` only moves forward; the replay guard only rises; a post is never
+Repository semantics already enforced, so nothing above should re-implement them:
+`sync_since` only moves forward *on an ACK* (`force_sync_since` is the deliberate
+exception, for a keep-alive); the replay guard only rises; a post is never
 returned to its own author; retention cannot delete an unsynced post;
 `next_post_ts` survives an NTP step backwards.
 
 ---
 
-## 8. Phase 6 — the room server (next)
-
-Spec: `examples/simple_room_server/MyMesh.cpp`. Build:
+## 8. Phase 6 — the room server (done)
 
 ```
-mesh/dispatcher.py   demux inbound packets across rooms by dest hash
-mesh/dedupe.py       packet_hash seen-table with TTL (also drops our own echoes)
-mesh/scheduler.py    delayed sends (SERVER_RESPONSE_DELAY etc.)
-mesh/clock.py        wall clock + unique timestamps
-room/acl.py          member -> password -> allow_unknown resolution
-room/server.py       login, post, push/ack loop, keep-alive, requests
-room/posts.py        post ingestion + welcome message splitting
-room/stats.py        the 52-byte ServerStats struct
-room/admin_cli.py    over-the-air CLI (TXT_TYPE_CLI_DATA, admins only)
-tests/fakes/client.py  THE CLIENT HALF of MeshCore — build this first
+mesh/clock.py        wall + monotonic + sleep, all injectable      100%
+mesh/dedupe.py       packet_hash seen-table, TTL and capacity      100%
+mesh/scheduler.py    delayed sends; `Timings` holds every delay     99%
+mesh/dispatcher.py   demux by dest hash; the only place we TX       97%
+room/acl.py          member -> password -> allow_unknown           100%
+room/posts.py        post text in and out, welcome splitting       100%
+room/stats.py        the 52-byte ServerStats struct + RadioStats   100%
+room/admin_cli.py    the over-the-air console, and its refusals    100%
+room/server.py       login, post, push/ack, keep-alive, requests    95%
+tests/fakes/client.py  the client half of MeshCore, for real
+tests/fakes/room.py    ManualClock, CapturingSink, `drain`
 ```
 
-**Build `tests/fakes/client.py` first.** It is what makes every room assertion
-possible: it must construct `ANON_REQ` logins, post, ACK, send keep-alives, and
-decrypt pushes. Without it the room server cannot be tested end to end.
+**What was built, and the parts that are easy to get wrong:**
 
-### The single most important detail
+- **Byte 7 of the login response is the permission level.** This is the whole
+  reason the project exists, and it is invisible in logs. It is asserted through
+  `tests.fakes.client.assert_login_grants`, whose failure message says what a
+  zero there means.
+- **A refused login gets no reply at all** — silence, not an error. A wrong
+  password is then indistinguishable from being out of range.
+- **Flood in → `PAYLOAD_TYPE_PATH` with the response bundled inside; direct in →
+  plain `RESPONSE`.** The PATH form is how the client learns the route here; a
+  plain reply would answer the question and leave it flooding forever. Flooded
+  replies are un-scoped (trap #9).
+- **The dispatcher is the only place that transmits**, so every outbound packet
+  is marked in the seen-table first. That is what stops us processing our own
+  packets when a repeater echoes them back through the node.
+- **Hash collisions are handled, not assumed away**, in both directions: two
+  rooms sharing a destination byte, and two clients sharing a source byte. The
+  MAC disambiguates; both have explicit tests.
+- **One outstanding push per client, round-robin.** Two in flight would race on
+  a 4-byte ACK hash and advance `sync_since` past a post never acknowledged.
+- **Welcome chunks are pushed like posts but are not posts** — per-client, not in
+  the post table, and acknowledging one does not move `sync_since`.
+- **The admin CLI refuses `setperm`/`set`/`password`/`clock sync`/`time`/`erase`/
+  `reboot` by name**, each saying where the setting actually lives. Silently
+  ignoring `setperm` would let an operator believe someone is an admin who is not.
 
-The login reply is **13 bytes**, and byte 7 carries the real permission value:
-
-```
-[ts:4][RESP_SERVER_LOGIN_OK=0][0][legacy_admin][permissions][rand:4][FIRMWARE_VER_LEVEL=1]
-```
-
-- `permissions` = `Permission.GUEST|READ_ONLY|READ_WRITE|ADMIN` (0–3).
-  **meshcore-pi hardcodes this to 0, which is the bug that makes every room
-  read-only.** Getting it right is the project's reason to exist.
-- `legacy_admin` = `1` if admin, else `2` if permissions == 0, else `0`
-- This is **invisible in logs** — it must be verified in a real app by checking
-  that a compose box appears.
-
-### Other Phase 6 requirements
-
-- Flood-routed login → reply as `PAYLOAD_TYPE_PATH` with the response bundled;
-  direct → plain `RESPONSE`. Mirror the request's route type and transport codes
-  (unscoped floods get dropped by repeaters running `flood.max.unscoped=0`).
-- Posts: role ≥ `read_write` → store + ACK. Guests and read-only get **neither**.
-  A retry (same timestamp) re-ACKs without double-posting; older is a replay.
-- Push: per-room round-robin, one outstanding push per client,
-  `TXT_TYPE_SIGNED_PLAIN` with the author's 4-byte pubkey prefix, post held
-  `POST_SYNC_DELAY_SECS=6`, `SYNC_PUSH_INTERVAL=1200ms`, ACK timeout
-  4s+2s/hop direct or 12s flood, 3 failures → client goes quiet.
-- `REQ_TYPE_KEEP_ALIVE` (direct only) → ACK with an appended unsynced-count byte.
-- `REQ_TYPE_GET_STATUS` → 52-byte struct `<HHhhIIIIIIIIHhHHHH` + reflected timestamp.
-- `REQ_TYPE_GET_ACCESS_LIST` (admin) → 6-byte pubkey prefix + permissions each.
-- Admin CLI: `ver`, `clock`, `advert`, `advert.zerohop`, `clear stats`, `get acl`,
-  `room.post <msg>`; explicit refusals for `setperm`/`set`/`password` explaining
-  that config owns the ACL. Reflect the `XX|` prefix.
-- Welcome message on first sync (`sync_since == 0`), split with `utf8_split`.
-- **Hash collisions across rooms must be handled, not assumed away** — the dest
-  hash is one byte. MAC verification disambiguates. This needs an explicit test.
-- ADVERT packets can be ignored entirely: a room learns a client's public key from
-  the login itself, so there is no contact book.
-
----
+**Deliberately not done:** `REQ_TYPE_GET_TELEMETRY_DATA` (there are no sensors on
+a host running this), and `ADVERT` handling (a room learns a client's key from
+the login itself, so it keeps no contact book).
 
 ## 9. Phases 7–8
 
-**7 — app + CLI:** `asyncio.TaskGroup` supervision, `upgrade_to_head` at startup,
+**7 — app + CLI:** nothing constructs the Phase 6 objects yet. The wiring is:
+one `Store`, one `CompanionLink`, one `SeenTable`/`RadioStats`, one `Scheduler`,
+one `UniqueClock`, and one `RoomServer` per configured room, all handed to a
+single `Dispatcher`, with `dispatcher.run(link.packets())` plus each room's
+`run_push_loop()` and `run_advert_loop()` under one `TaskGroup` (see trap #1).
+`RoomServer.start()` must run before the loops; `RoomServer.apply_settings()` is
+the SIGHUP path. `asyncio.TaskGroup` supervision, `upgrade_to_head` at startup,
 SIGHUP reload (re-resolve roles; keep sync cursors), SIGTERM graceful shutdown,
 stderr logging. Subcommands: `run`, `check-config`, `keygen`, `doctor`, `db`.
 `doctor` should use `probe_raw_packet_support` and report the node's identity.
@@ -356,5 +381,11 @@ uv run meshelle run --config room.toml --log-level debug
   ACL byte.
 - `transport/ble.py` is at 55% — the happy path needs hardware and belongs to
   `doctor`, not unit tests. Do not fake it with mocks for a coverage number.
-- The approved plan is at `~/.claude/plans/eventual-questing-whistle.md`.
+- Scoped (`TRANSPORT_FLOOD`) replies would need a region transport key in the
+  config. Un-scoped works on any mesh whose repeaters allow wildcard flooding,
+  which is the default; a mesh running `flood.max.unscoped=0` would need this.
+- `REQ_TYPE_GET_TELEMETRY_DATA` returns nothing. If a host ever grows sensors
+  worth reporting, that is where they go.
+- The approved plan file (`~/.claude/plans/eventual-questing-whistle.md`) is
+  gone; this document is the plan now.
 - If you want this file auto-loaded each run, reference it from a `CLAUDE.md`.
