@@ -38,9 +38,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +54,7 @@ from meshelle.app import (
     room_key_path,
 )
 from meshelle.companion.link import CompanionError, CompanionLink
+from meshelle.config.dotenv import DotenvError, DotenvResult, load_dotenv
 from meshelle.config.loader import ConfigError, load_settings
 from meshelle.config.model import LogFormat, LogLevel, RoomSettings, Settings
 from meshelle.logs import LoggingError, configure_logging
@@ -66,12 +69,15 @@ from meshelle.store.migrate import (
 )
 from meshelle.transport.base import Transport, TransportError
 
+logger = logging.getLogger(__name__)
+
 EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_USAGE = 2
 """argparse's own exit code for a bad invocation; reused for a missing subcommand."""
 
 CONFIG_ENV_VAR = "MESHELLE_CONFIG"
+ENV_FILE_ENV_VAR = "MESHELLE_ENV_FILE"
 
 DEFAULT_CONFIG_PATHS = (
     Path("meshelle.toml"),
@@ -79,6 +85,14 @@ DEFAULT_CONFIG_PATHS = (
 )
 """Searched in order when ``--config`` is absent. Deliberately short: a config
 found somewhere the operator did not expect is worse than being asked for one."""
+
+DEFAULT_ENV_FILE_NAME = ".env"
+"""Looked for beside the config file only -- never in the working directory.
+
+Same reason ``paths.anchor`` measures from the config file: a service runs with
+``WorkingDirectory=/``, so a ``.env`` picked up from the CWD would apply when
+the operator tested by hand and vanish once it was installed properly, which
+presents as a password that works only in the terminal."""
 
 DOCTOR_TIMEOUT = 30.0
 """Long enough for a node that is busy, short enough that a wrong port fails
@@ -107,6 +121,12 @@ def _common_options() -> argparse.ArgumentParser:
         type=Path,
         metavar="PATH",
         help=f"config file (default: ${CONFIG_ENV_VAR}, ./meshelle.toml, /etc/meshelle/)",
+    )
+    parent.add_argument(
+        "--env-file",
+        type=Path,
+        metavar="PATH",
+        help=f"env file to load (default: ${ENV_FILE_ENV_VAR}, or .env beside the config)",
     )
     parent.add_argument(
         "--log-level",
@@ -211,6 +231,39 @@ def find_config(explicit: Path | None, environ: dict[str, str] | None = None) ->
     raise UsageError(f"no config file given and none found. Tried: {searched}. Use --config PATH.")
 
 
+def find_env_file(
+    explicit: Path | None,
+    config_path: Path | None = None,
+    environ: dict[str, str] | None = None,
+) -> Path | None:
+    """Locate the env file, or ``None`` when there is nothing to load.
+
+    An asked-for file that is missing is an error, the same way ``--config`` is:
+    a run that was meant to get its passwords from a file and silently got none
+    starts a room with no admin, which is discovered by someone else.
+
+    Note the ordering this implies: the config file is found *first*, so
+    ``MESHELLE_CONFIG`` set inside a ``.env`` cannot choose the config -- there
+    would be nowhere to look for the ``.env`` until the config was already known.
+    """
+    source = os.environ if environ is None else environ
+
+    if explicit is not None:
+        if not explicit.exists():
+            raise UsageError(f"env file not found: {explicit}")
+        return explicit
+
+    from_env = source.get(ENV_FILE_ENV_VAR)
+    if from_env:
+        path = Path(from_env)
+        if not path.exists():
+            raise UsageError(f"{ENV_FILE_ENV_VAR} points at a missing file: {path}")
+        return path
+
+    beside_config = config_base(config_path) / DEFAULT_ENV_FILE_NAME
+    return beside_config if beside_config.is_file() else None
+
+
 def cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
     """Flags that override config values, in the shape the loader merges."""
     log: dict[str, Any] = {}
@@ -226,10 +279,30 @@ def cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _load(args: argparse.Namespace) -> tuple[Path, Settings, dict[str, Any]]:
+@dataclass(frozen=True, slots=True)
+class Loaded:
+    """Everything the subcommands need out of the loading step.
+
+    A record rather than a tuple because the env file has to travel with the
+    settings: ``run`` logs it, the diagnostics print it, and a reload has to
+    re-read it.
+    """
+
+    path: Path
+    settings: Settings
+    overrides: dict[str, Any]
+    env_file: DotenvResult
+
+
+def _load(args: argparse.Namespace) -> Loaded:
     path = find_config(args.config)
+    # The env file goes into the environment before the config is validated, so
+    # both MESHELLE_* overrides and env: password indirection can come from it.
+    env_path = find_env_file(args.env_file, path)
+    env_file = load_dotenv(env_path) if env_path is not None else DotenvResult()
     overrides = cli_overrides(args)
-    return path, load_settings(path, overrides=overrides), overrides
+    settings = load_settings(path, overrides=overrides, env_sources=env_file.sources)
+    return Loaded(path=path, settings=settings, overrides=overrides, env_file=env_file)
 
 
 def _describe_room(slug: str, room: RoomSettings, key_path: Path | None) -> list[str]:
@@ -271,12 +344,17 @@ def _describe_room(slug: str, room: RoomSettings, key_path: Path | None) -> list
 
 
 def command_check_config(args: argparse.Namespace) -> int:
-    path, settings, _ = _load(args)
+    loaded = _load(args)
+    path, settings = loaded.path, loaded.settings
     base = config_base(path)
     data_dir = anchor(settings.node.data_dir, base)
 
     lines = [
         f"{path}: valid",
+        # Named even when there is none: "which .env did it read?" is the first
+        # question asked about a password that is set in a file and not in
+        # effect, and silence there reads as "it must have loaded it".
+        f"  {loaded.env_file.describe()}",
         f"  companion: {settings.companion.transport.value} "
         f"{settings.companion.port or settings.companion.host or settings.companion.address}",
         f"  data directory: {data_dir}",
@@ -284,6 +362,11 @@ def command_check_config(args: argparse.Namespace) -> int:
         f"  logging: {settings.log.level.value}/{settings.log.format.value}"
         + (f" + {anchor(settings.log.file, base)}" if settings.log.file else ""),
     ]
+    # The mode warning belongs here as well as in doctor: writing the .env is
+    # what check-config is normally run straight after, and that is the moment
+    # the permissions can still be fixed before a password has been in a
+    # world-readable file on a running box.
+    lines.extend(f"  warning: {warning}" for warning in loaded.env_file.warnings)
     for slug, room in settings.rooms.items():
         lines.extend(_describe_room(slug, room, room_key_path(slug, room, data_dir)))
 
@@ -292,7 +375,8 @@ def command_check_config(args: argparse.Namespace) -> int:
 
 
 def command_keygen(args: argparse.Namespace) -> int:
-    path, settings, _ = _load(args)
+    loaded = _load(args)
+    path, settings = loaded.path, loaded.settings
     data_dir = anchor(settings.node.data_dir, config_base(path))
 
     if args.room is not None:
@@ -334,7 +418,8 @@ def command_keygen(args: argparse.Namespace) -> int:
 
 
 def command_db(args: argparse.Namespace) -> int:
-    path, settings, _ = _load(args)
+    loaded = _load(args)
+    path, settings = loaded.path, loaded.settings
     db_path = anchor(settings.node.database_path, config_base(path))
     action = args.db_command or "current"
 
@@ -363,6 +448,7 @@ async def _doctor(
     settings: Settings,
     path: Path,
     *,
+    env_file: DotenvResult | None = None,
     transport_factory: Callable[[], Transport] | None = None,
 ) -> int:
     """Report anything that would stop a run, and return 1 if there is any.
@@ -377,6 +463,12 @@ async def _doctor(
     problems: list[str] = []
 
     print(f"config:   {path}: valid")
+    if env_file is not None and env_file.path is not None:
+        print(f"env:      {env_file.path}: {env_file.detail}")
+        for warning in env_file.warnings:
+            # Advisory, not a problem: a loose mode does not stop a run, and
+            # exiting 1 over it would train operators to ignore doctor.
+            print(f"env:      warning -- {warning}")
 
     current, head = current_revision(db_path), head_revision()
     if not db_path.exists():
@@ -461,14 +553,26 @@ async def _doctor(
 
 
 def command_doctor(args: argparse.Namespace) -> int:
-    path, settings, _ = _load(args)
-    return asyncio.run(_doctor(settings, path))
+    loaded = _load(args)
+    return asyncio.run(_doctor(loaded.settings, loaded.path, env_file=loaded.env_file))
 
 
 def command_run(args: argparse.Namespace) -> int:
-    path, settings, overrides = _load(args)
-    configure_logging(settings.log, base=config_base(path))
-    app = Application(settings, config_path=path, overrides=overrides)
+    loaded = _load(args)
+    configure_logging(loaded.settings.log, base=config_base(loaded.path))
+    if loaded.env_file.path is not None:
+        # Logged after configure_logging, not printed during loading: which
+        # variables a run took from a file is exactly what a later incident
+        # wants from the journal.
+        logger.info("loaded %s", loaded.env_file.describe().removeprefix("env file: "))
+        for warning in loaded.env_file.warnings:
+            logger.warning("%s", warning)
+    app = Application(
+        loaded.settings,
+        config_path=loaded.path,
+        overrides=loaded.overrides,
+        env_file=loaded.env_file,
+    )
     return asyncio.run(app.run())
 
 
@@ -499,6 +603,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (
         AppError,
         ConfigError,
+        DotenvError,
         IdentityError,
         LoggingError,
         MigrationError,
