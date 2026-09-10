@@ -380,6 +380,22 @@ class TestRetention:
         assert removed == 3
         assert {p.post_ts for p in repo.recent_posts(session, room_id)} == {103, 104}
 
+    def test_the_two_policies_are_independent_reasons_to_delete(
+        self, session: Session, room_id: int
+    ) -> None:
+        """OR, not AND.
+
+        Requiring both would make ``max_posts`` a dead letter whenever
+        ``post_retention`` is also set -- which it is by default -- so a busy
+        room would grow past its declared cap until its posts aged out.
+        """
+        self._posts(session, room_id, 5)  # post_ts 100..104, none of them old
+
+        removed = repo.prune_posts(session, room_id, older_than=0, keep_newest=2)
+
+        assert removed == 3, "the count policy must bind on its own"
+        assert {p.post_ts for p in repo.recent_posts(session, room_id)} == {103, 104}
+
     def test_never_prunes_a_post_a_client_has_not_been_sent(
         self, session: Session, room_id: int
     ) -> None:
