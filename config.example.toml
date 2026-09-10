@@ -1,0 +1,168 @@
+# meshelle — example configuration
+#
+# Copy this to meshelle.toml, edit it, and check it before you run anything:
+#
+#     meshelle check-config --config meshelle.toml
+#
+# Unknown keys are errors, not warnings. That is deliberate: a misspelled ACL
+# key that is silently ignored leaves a room with no admins and nothing to say
+# so. Every error names the file and line it came from.
+#
+# Relative paths below are relative to THIS FILE, not to the directory you
+# happen to run meshelle from. A systemd unit runs with WorkingDirectory=/,
+# and one config resolving to two different databases is not a useful surprise.
+
+
+# ---------------------------------------------------------------------------
+# The companion node — required
+# ---------------------------------------------------------------------------
+# meshelle drives a stock MeshCore companion node as a bare radio modem. It
+# owns every room identity itself; the node only puts bytes on and off the air.
+#
+# The node's firmware must have CMD_SEND_RAW_PACKET (65). `meshelle doctor`
+# checks for it without transmitting anything.
+
+[companion]
+transport = "serial"          # serial | tcp | ble
+port = "/dev/ttyUSB0"         # serial: the device path
+baud_rate = 115200            # serial: default 115200
+
+# transport = "tcp"           # for a node exposed over the network
+# host = "192.168.1.50"
+# tcp_port = 5000
+
+# transport = "ble"           # needs the 'ble' extra: pip install meshelle[ble]
+# address = "AA:BB:CC:DD:EE:FF"
+
+
+# ---------------------------------------------------------------------------
+# Where state lives
+# ---------------------------------------------------------------------------
+
+[node]
+data_dir = "data"
+# Holds meshelle.db (posts, clients, sync cursors) and each room's key file.
+# Back this directory up. A lost room key cannot be recovered, and every client
+# holds that key in its contact list — regenerating one looks to them like the
+# room stopped existing.
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+[log]
+level = "info"                # debug | info | warning | error
+format = "text"               # text | json
+# file = "meshelle.log"       # optional; stderr is ALWAYS written as well
+
+
+# ---------------------------------------------------------------------------
+# Defaults inherited by every room
+# ---------------------------------------------------------------------------
+# Anything here can be overridden inside a [room.*] section. Do not put `name`
+# here — rooms must be distinguishable, and meshelle refuses to start if two
+# rooms advertise the same name.
+
+[defaults]
+advert_flood_interval = "6h"  # how often to announce across the whole mesh
+advert_local_interval = "30m" # zero-hop announce, for immediate neighbours
+post_retention = "30d"        # delete posts older than this; "never" to keep
+max_posts = 5000              # per room; omit or "unlimited" for no cap
+
+# Retention policies are independent reasons to delete: a post goes if it is
+# too old OR past the count. Neither ever deletes a post a known client has not
+# been sent yet.
+#
+# Durations accept "30m", "6h", "1h30m", "7d", "2w", a plain number of seconds,
+# or "never"/"forever" to disable.
+
+
+# ---------------------------------------------------------------------------
+# A room
+# ---------------------------------------------------------------------------
+# The section name (`lobby`) is the room's slug: it names the key file, the
+# database row and the log lines. `name` is what clients see; it defaults to
+# the slug.
+
+[room.lobby]
+name = "The Lobby"
+
+# Identity. Leave both of these unset and meshelle generates data/lobby.key on
+# first run, at mode 0600, and logs the public key once. Generate it ahead of
+# time with: meshelle keygen --room lobby
+#
+# key_file = "lobby.key"      # relative to node.data_dir
+# private_key = "..."         # 64 or 128 hex chars, to adopt an existing room
+#
+# Never share a key between two rooms, or with the companion node itself. Two
+# state machines answering one destination hash produce conflicting replies and
+# mutually-overwriting sync cursors. meshelle refuses to start if it detects it.
+
+welcome = """
+Welcome to the lobby.
+Posts here are kept for 30 days.
+"""
+
+# What happens to a client that matches no member entry and no password:
+#   reject | guest | read_only | read_write
+allow_unknown = "read_only"
+
+# Optional location, shown in clients that display one. Both or neither.
+# latitude = 51.5074
+# longitude = -0.1278
+
+
+# --- Passwords ---------------------------------------------------------------
+# A client that logs in with one of these is granted that role. Omit a key to
+# disable that route entirely.
+#
+# Values support indirection so secrets need not sit in this file:
+#   "env:LOBBY_ADMIN_PW"      read from an environment variable
+#   "file:/run/secrets/lobby" read from a file (trailing newline stripped)
+
+[room.lobby.passwords]
+admin = "env:LOBBY_ADMIN_PW"
+read_write = "env:LOBBY_WRITE_PW"
+# read_only = "..."
+#
+# An unset variable is a startup error naming the variable, not a room that
+# quietly has no admin password. Set them where the service can see them —
+# systemd's EnvironmentFile=, or an exported shell variable for a manual run.
+
+
+# --- Members -----------------------------------------------------------------
+# Declared roles, matched on the full public key. A member's declared role wins
+# over any password, which is what makes a demotion here actually demote: an
+# ex-admin who still knows the admin password does not stay an admin.
+#
+# Roles: guest | read_only | read_write | admin
+#
+# This is the whole ACL. `setperm` over the air is refused by name, so this file
+# is always the source of truth — send SIGHUP to re-read it without dropping a
+# single client's sync position.
+
+[[room.lobby.member]]
+pubkey = "1ec77175b0918ed206f9ae04ec136d6d5d4315bb26305427f645b492e9350c10"
+role = "admin"
+note = "the operator"         # free text, shown in `get acl`
+
+[[room.lobby.member]]
+pubkey = "3f2a91c4d5e6b7a8901234567890abcdef1234567890abcdef1234567890abcd"
+role = "read_write"
+note = "alice"
+
+
+# ---------------------------------------------------------------------------
+# A second room, inheriting [defaults] and overriding two of them
+# ---------------------------------------------------------------------------
+
+[room.ops]
+name = "Ops"
+allow_unknown = "reject"      # members and passwords only
+post_retention = "never"      # an ops log is worth keeping
+max_posts = 20000
+
+[room.ops.passwords]
+admin = "env:OPS_ADMIN_PW"
+# admin = "file:/run/secrets/ops-admin"    # the file: form, for a secrets mount
