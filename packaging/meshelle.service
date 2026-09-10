@@ -1,0 +1,69 @@
+# meshelle — MeshCore room server
+#
+#   sudo install -m644 packaging/meshelle.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now meshelle
+#
+# Assumes a 'meshelle' system user, /etc/meshelle/meshelle.toml, and state in
+# /var/lib/meshelle. Create the user with:
+#
+#   sudo useradd --system --home /var/lib/meshelle --shell /usr/sbin/nologin meshelle
+#   sudo usermod -aG dialout meshelle          # serial transport only
+#
+# and set data_dir = "/var/lib/meshelle" in the config, since relative paths
+# there resolve against the config file's directory (/etc/meshelle).
+
+[Unit]
+Description=meshelle MeshCore room server
+Documentation=https://github.com/cwlls/meshelle
+After=network.target
+
+[Service]
+Type=exec
+User=meshelle
+Group=meshelle
+ExecStart=/usr/local/bin/meshelle run --config /etc/meshelle/meshelle.toml
+
+# SIGHUP re-reads the config and re-resolves every ACL without dropping a
+# client's sync position. An invalid config is refused and the running one kept,
+# so `systemctl reload` can never cost a room its ACL.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Passwords written as env:NAME in the config are read from here. Keep it
+# mode 0600 and owned by root, so the config file itself carries no secrets.
+# EnvironmentFile=-/etc/meshelle/secrets.env
+
+# meshelle logs to stderr; journald captures it. Set log.format = "json" in the
+# config if you ship the journal somewhere that parses it.
+
+Restart=on-failure
+RestartSec=5s
+
+# The database lives here. StateDirectory creates it 0750 and owned by the
+# service user on first start.
+StateDirectory=meshelle
+WorkingDirectory=/var/lib/meshelle
+
+# Hardening. meshelle needs the serial device and its own state directory, and
+# nothing else. Drop anything here that your setup actually needs -- a TCP or
+# BLE node, for instance, needs the network rules relaxed.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=false
+DeviceAllow=char-ttyUSB rw
+DeviceAllow=char-ttyACM rw
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
