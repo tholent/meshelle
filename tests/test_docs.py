@@ -36,7 +36,7 @@ from pathlib import Path
 
 import pytest
 
-from meshelle.cli import main
+from meshelle.cli import DEFAULT_ENV_FILE_NAME, ENV_FILE_ENV_VAR, build_parser, main
 from meshelle.config.loader import ConfigError, load_settings
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -136,3 +136,32 @@ class TestDependencyRecord:
             if re.split(r"[<>=!~\[]", spec, maxsplit=1)[0].strip() not in recorded
         ]
         assert missing == [], f"not in docs/DEPENDENCIES.md: {missing}"
+
+
+class TestEnvFileDocs:
+    """The env file is documented by name in three places, and renaming any of
+    the three constants would leave all three standing and wrong.
+
+    That is the same failure the README command test guards against, but worse
+    here: an operator following a stale name gets a file that is silently never
+    read, and a room with no admin password.
+    """
+
+    def test_the_readme_names_the_environment_variable(self) -> None:
+        assert ENV_FILE_ENV_VAR in README.read_text(encoding="utf-8")
+
+    def test_the_readme_names_the_default_file(self) -> None:
+        assert DEFAULT_ENV_FILE_NAME in README.read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("command", ["run", "check-config", "keygen", "doctor", "db"])
+    def test_every_command_accepts_the_flag(self, command: str) -> None:
+        """The README promises it on every command, not just run."""
+        args = build_parser().parse_args([command, "--env-file", "secrets.env"])
+        assert args.env_file == Path("secrets.env")
+
+    def test_the_example_config_points_somewhere_real(self) -> None:
+        """Its comments tell an operator where to put the passwords it refuses
+        to hold; a name that has drifted sends them to write a file nothing
+        reads."""
+        text = EXAMPLE_CONFIG.read_text(encoding="utf-8")
+        assert DEFAULT_ENV_FILE_NAME in text

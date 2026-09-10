@@ -34,6 +34,7 @@ real.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import sys
 from collections.abc import AsyncIterator, Iterator
@@ -68,6 +69,25 @@ def _isolate_logging() -> Iterator[None]:
     shutdown_logging()
     root.handlers[:] = handlers
     root.setLevel(level)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_environment() -> Iterator[None]:
+    """Undo any variable a test put into the real environment.
+
+    Loading a ``.env`` is *meant* to write to ``os.environ`` -- that is the
+    whole feature -- so a test that runs a CLI command against one leaves its
+    variables set for the rest of the session. ``monkeypatch`` cannot help:
+    it only restores names it set itself.
+
+    Autouse for the same reason as ``_isolate_logging``: the leak never fails
+    the test that causes it. It fails a later test that asserts a password is
+    *absent*, which is exactly the assertion the env layer exists to support.
+    """
+    snapshot = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(snapshot)
 
 
 @pytest.fixture(scope="session")

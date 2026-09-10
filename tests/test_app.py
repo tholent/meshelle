@@ -40,9 +40,11 @@ from typing import Any
 import pytest
 
 from meshelle.app import AppError, Application, make_transport_factory, plan_rooms, room_key_path
+from meshelle.config.dotenv import DotenvResult, load_dotenv
 from meshelle.config.loader import load_settings
 from meshelle.config.model import (
     CompanionSettings,
+    LogLevel,
     RoomSettings,
     Settings,
     TransportKind,
@@ -301,6 +303,7 @@ def build_app(
     config_path: Path | None = None,
     node: FakeCompanion | None = None,
     settings: Settings | None = None,
+    env_file: DotenvResult | None = None,
     **room_overrides: Any,
 ) -> RunningApp:
     companion = node or FakeCompanion()
@@ -308,6 +311,7 @@ def build_app(
     app = Application(
         resolved,
         config_path=config_path,
+        env_file=env_file,
         transport_factory=lambda: companion,
         timings=FAST,
         # Signal handlers are process-global; installing them here would leave
@@ -582,6 +586,93 @@ class TestReload:
             with caplog.at_level(logging.WARNING):
                 running.app.reload()
         assert "no file" in caplog.text
+
+
+class TestEnvFileReload:
+    """SIGHUP re-reads the ``.env`` before the config, and owns what it set.
+
+    The ordering matters: the config is validated against the *fresh*
+    environment, so a password rotated in the file is the one the reloaded ACL
+    carries. The ownership matters more -- a value left behind in
+    ``os.environ`` keeps working for the life of the process, and stopping that
+    is the reason an operator reloads at all.
+    """
+
+    def setup_env(self, tmp_path: Path, text: str) -> tuple[Path, Path]:
+        config = write_config(tmp_path, minimal_config())
+        env_path = tmp_path / ".env"
+        env_path.write_text(text, encoding="utf-8")
+        env_path.chmod(0o600)
+        return config, env_path
+
+    async def test_a_rotated_value_takes_effect(self, tmp_path: Path) -> None:
+        config, env_path = self.setup_env(tmp_path, "MESHELLE_LOG__LEVEL=error\n")
+        result = load_dotenv(env_path)
+        settings = load_settings(config, env_sources=result.sources)
+
+        async with build_app(
+            tmp_path, config_path=config, settings=settings, env_file=result
+        ) as running:
+            env_path.write_text("MESHELLE_LOG__LEVEL=debug\n", encoding="utf-8")
+            running.app.reload()
+
+            assert running.app.settings.log.level is LogLevel.DEBUG
+
+    async def test_a_deleted_line_stops_applying(self, tmp_path: Path) -> None:
+        """The revocation case. If the old value survived in os.environ the
+        reload would report success and change nothing -- a password removed
+        from the file would keep letting its holder in."""
+        config, env_path = self.setup_env(tmp_path, "MESHELLE_LOG__LEVEL=error\n")
+        result = load_dotenv(env_path)
+        settings = load_settings(config, env_sources=result.sources)
+
+        async with build_app(
+            tmp_path, config_path=config, settings=settings, env_file=result
+        ) as running:
+            # Bound to a local: asserting on the attribute directly narrows its
+            # type for the rest of the function, and mypy then reads the
+            # post-reload check as a comparison that cannot hold.
+            before = running.app.settings.log.level
+            assert before is LogLevel.ERROR
+
+            env_path.write_text("# nothing here now\n", encoding="utf-8")
+            running.app.reload()
+
+            assert running.app.settings.log.level is LogLevel.INFO
+            assert "MESHELLE_LOG__LEVEL" not in os.environ
+
+    async def test_a_broken_env_file_is_refused_whole(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Parsing happens before anything is removed, so a typo saved into a
+        live .env cannot strip the running process of its passwords."""
+        config, env_path = self.setup_env(tmp_path, "MESHELLE_LOG__LEVEL=error\n")
+        result = load_dotenv(env_path)
+        settings = load_settings(config, env_sources=result.sources)
+
+        async with build_app(
+            tmp_path, config_path=config, settings=settings, env_file=result
+        ) as running:
+            before = running.app.settings
+            env_path.write_text("MESHELLE_LOG__LEVEL=error\nbroken line\n", encoding="utf-8")
+
+            with caplog.at_level(logging.ERROR):
+                running.app.reload()
+
+            assert running.app.settings is before
+            assert "reload refused" in caplog.text
+            assert os.environ["MESHELLE_LOG__LEVEL"] == "error"
+
+    async def test_a_run_without_an_env_file_reloads_normally(self, tmp_path: Path) -> None:
+        """Most deployments have none; the reload path must not assume one."""
+        config = write_config(tmp_path, minimal_config())
+        settings = load_settings(config)
+
+        async with build_app(tmp_path, config_path=config, settings=settings) as running:
+            config.write_text('[log]\nlevel = "debug"\n' + minimal_config(), encoding="utf-8")
+            running.app.reload()
+
+            assert running.app.settings.log.level is LogLevel.DEBUG
 
 
 class LogWatcher(logging.Handler):

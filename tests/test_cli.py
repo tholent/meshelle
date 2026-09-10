@@ -29,11 +29,23 @@ neither is visible from a passing exit code:
 
 from __future__ import annotations
 
+import argparse
+import logging
 from pathlib import Path
 
 import pytest
 
-from meshelle.cli import DEFAULT_CONFIG_PATHS, UsageError, _doctor, find_config, main
+from meshelle.cli import (
+    DEFAULT_CONFIG_PATHS,
+    ENV_FILE_ENV_VAR,
+    UsageError,
+    _doctor,
+    _load,
+    build_parser,
+    find_config,
+    find_env_file,
+    main,
+)
 from meshelle.config.loader import load_settings
 from meshelle.proto.identity import LocalIdentity, load_identity, save_identity
 from meshelle.store.migrate import current_revision, head_revision
@@ -91,6 +103,246 @@ class TestFindConfig:
             find_config(None, {})
         for candidate in DEFAULT_CONFIG_PATHS:
             assert str(candidate) in str(caught.value)
+
+
+ENV_CONFIG = """
+[companion]
+transport = "tcp"
+host = "127.0.0.1"
+
+[node]
+data_dir = "data"
+
+[room.lobby]
+name = "Lobby"
+passwords = { admin = "env:LOBBY_ADMIN_PW" }
+"""
+"""A config that deliberately ships no working password, so what the env file
+supplies is the difference between a room with an admin and one without."""
+
+
+@pytest.fixture
+def env_config(tmp_path: Path) -> Path:
+    path = tmp_path / "room.toml"
+    path.write_text(ENV_CONFIG, encoding="utf-8")
+    return path
+
+
+def write_env_file(directory: Path, text: str, name: str = ".env") -> Path:
+    path = directory / name
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def _args(config: Path, env_file: Path | None = None) -> argparse.Namespace:
+    """Parsed arguments for the loading step, via the real parser.
+
+    Hand-building a Namespace would keep passing after a flag was renamed or
+    given a default, which is the drift these tests exist to catch.
+    """
+    argv = ["check-config", "--config", str(config)]
+    if env_file is not None:
+        argv += ["--env-file", str(env_file)]
+    return build_parser().parse_args(argv)
+
+
+class TestFindEnvFile:
+    def test_an_explicit_missing_file_is_an_error(self, tmp_path: Path) -> None:
+        """The same rule as --config, for the same reason: a run that was meant
+        to take its passwords from a file and silently got none starts a room
+        with no admin, and somebody else finds out."""
+        with pytest.raises(UsageError, match="env file not found"):
+            find_env_file(tmp_path / "absent.env", None, {})
+
+    def test_an_explicit_file_is_used(self, tmp_path: Path) -> None:
+        path = write_env_file(tmp_path, "PW=x", name="secrets.env")
+        assert find_env_file(path, None, {}) == path
+
+    def test_the_environment_variable_is_honoured(self, tmp_path: Path) -> None:
+        path = write_env_file(tmp_path, "PW=x")
+        assert find_env_file(None, None, {ENV_FILE_ENV_VAR: str(path)}) == path
+
+    def test_a_missing_environment_path_names_the_variable(self, tmp_path: Path) -> None:
+        with pytest.raises(UsageError, match=ENV_FILE_ENV_VAR):
+            find_env_file(None, None, {ENV_FILE_ENV_VAR: str(tmp_path / "gone.env")})
+
+    def test_a_dot_env_beside_the_config_is_found(self, env_config: Path) -> None:
+        path = write_env_file(env_config.parent, "PW=x")
+        assert find_env_file(None, env_config, {}) == path
+
+    def test_no_env_file_at_all_is_not_an_error(self, env_config: Path) -> None:
+        """Most deployments have none: systemd's EnvironmentFile= does the job,
+        and refusing to start without a .env would break every one of them."""
+        assert find_env_file(None, env_config, {}) is None
+
+    def test_the_working_directory_is_not_searched(
+        self, env_config: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A service runs with WorkingDirectory=/, so a .env picked up from the
+        CWD would apply when the operator tested by hand and vanish once it was
+        installed -- a password that works only in the terminal."""
+        elsewhere = tmp_path / "cwd"
+        elsewhere.mkdir()
+        write_env_file(elsewhere, "PW=from the working directory")
+        monkeypatch.chdir(elsewhere)
+
+        assert find_env_file(None, env_config, {}) is None
+
+    def test_an_explicit_file_outranks_the_variable(self, tmp_path: Path) -> None:
+        """The flag is the operator typing right now; the variable is ambient."""
+        flag = write_env_file(tmp_path, "PW=x", name="flag.env")
+        ambient = write_env_file(tmp_path, "PW=y", name="ambient.env")
+
+        assert find_env_file(flag, None, {ENV_FILE_ENV_VAR: str(ambient)}) == flag
+
+    def test_a_directory_is_not_taken_as_a_default(self, env_config: Path) -> None:
+        """``.env`` as a directory is odd, but opening it would raise IsADirectory
+        from inside the reader rather than being ignored as "no env file"."""
+        (env_config.parent / ".env").mkdir()
+        assert find_env_file(None, env_config, {}) is None
+
+
+class TestEnvFileLoading:
+    def test_a_password_comes_from_the_env_file(
+        self, env_config: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The point of the feature: env: indirection with somewhere to put the
+        variable that is not one operator's shell history."""
+        write_env_file(env_config.parent, "LOBBY_ADMIN_PW=hunter2")
+
+        assert main(["check-config", "--config", str(env_config)]) == 0
+        assert "passwords: admin" in capsys.readouterr().out
+
+    def test_without_it_the_config_is_refused(
+        self, env_config: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The other half of the test above: it has to be the file that made the
+        difference, not a variable left over from somewhere else."""
+        assert main(["check-config", "--config", str(env_config)]) == 1
+        assert "LOBBY_ADMIN_PW" in capsys.readouterr().err
+
+    def test_the_real_environment_beats_the_env_file(
+        self, env_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """So an explicit override on the command line is not undone by a stale
+        file sitting beside the config."""
+        write_env_file(env_config.parent, "MESHELLE_LOG__LEVEL=error\nLOBBY_ADMIN_PW=x\n")
+        monkeypatch.setenv("MESHELLE_LOG__LEVEL", "debug")
+
+        settings = _load(_args(env_config)).settings
+
+        assert settings.log.level.value == "debug"
+
+    def test_meshelle_overrides_can_come_from_the_env_file(self, env_config: Path) -> None:
+        """The env file is not a config layer of its own -- it feeds the layer
+        that already exists, so MESHELLE_* works from it exactly as from a shell."""
+        write_env_file(env_config.parent, "MESHELLE_LOG__LEVEL=error\nLOBBY_ADMIN_PW=x\n")
+
+        settings = _load(_args(env_config)).settings
+
+        assert settings.log.level.value == "error"
+
+    def test_an_explicit_env_file_is_loaded(self, env_config: Path, tmp_path: Path) -> None:
+        secrets = write_env_file(tmp_path, "LOBBY_ADMIN_PW=hunter2", name="secrets.env")
+
+        loaded = _load(_args(env_config, env_file=secrets))
+
+        assert loaded.env_file.path == secrets
+        assert loaded.settings.rooms["lobby"].passwords.admin is not None
+
+    def test_a_malformed_env_file_explains_itself_on_stderr(
+        self, env_config: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """With the line number, and without a traceback burying it."""
+        write_env_file(env_config.parent, "LOBBY_ADMIN_PW=ok\nnot an assignment\n")
+
+        assert main(["check-config", "--config", str(env_config)]) == 1
+
+        captured = capsys.readouterr()
+        assert ".env:2" in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_an_error_blames_the_env_files_line(
+        self, env_config: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Told only the variable's name, an operator whose shell does not have
+        it set has nowhere to go and look."""
+        write_env_file(env_config.parent, "LOBBY_ADMIN_PW=ok\nMESHELLE_LOG__LEVEL=not-a-level\n")
+
+        assert main(["check-config", "--config", str(env_config)]) == 1
+
+        error = capsys.readouterr().err
+        assert "MESHELLE_LOG__LEVEL" in error
+        assert ".env:2" in error
+
+
+class TestEnvFileDiagnostics:
+    def test_check_config_names_the_env_file(
+        self, env_config: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        write_env_file(env_config.parent, "LOBBY_ADMIN_PW=hunter2")
+
+        main(["check-config", "--config", str(env_config)])
+
+        assert "env file:" in capsys.readouterr().out
+
+    def test_check_config_says_when_there_is_none(
+        self, config: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Silence would read as "it must have loaded one", which is the wrong
+        conclusion to leave an operator with while they hunt a password."""
+        main(["check-config", "--config", str(config)])
+
+        assert "env file: none" in capsys.readouterr().out
+
+    def test_check_config_warns_about_a_readable_env_file(
+        self, env_config: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Run straight after writing the file is the moment the permissions can
+        still be fixed before a password has sat world-readable on a live box."""
+        path = write_env_file(env_config.parent, "LOBBY_ADMIN_PW=hunter2")
+        path.chmod(0o644)
+
+        assert main(["check-config", "--config", str(env_config)]) == 0
+
+        assert "chmod 600" in capsys.readouterr().out
+
+    async def test_doctor_reports_the_env_file(
+        self, env_config: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        write_env_file(env_config.parent, "LOBBY_ADMIN_PW=hunter2")
+        loaded = _load(_args(env_config))
+        node = FakeCompanion()
+
+        await _doctor(
+            loaded.settings,
+            loaded.path,
+            env_file=loaded.env_file,
+            transport_factory=lambda: node,
+        )
+
+        assert "1 variable" in capsys.readouterr().out
+
+    async def test_a_loose_mode_is_a_warning_and_not_a_problem(
+        self, env_config: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Exiting 1 over a file that may hold nothing secret would train
+        operators to ignore doctor, which is worse than the mode."""
+        path = write_env_file(env_config.parent, "LOBBY_ADMIN_PW=hunter2")
+        path.chmod(0o644)
+        loaded = _load(_args(env_config))
+        node = FakeCompanion()
+
+        code = await _doctor(
+            loaded.settings,
+            loaded.path,
+            env_file=loaded.env_file,
+            transport_factory=lambda: node,
+        )
+
+        assert code == 0
+        assert "warning" in capsys.readouterr().out
 
 
 class TestOverrides:
@@ -428,6 +680,52 @@ class TestRunWiring:
         captured = capsys.readouterr()
         assert "both resolve to key file" in captured.err
         assert "Traceback" not in captured.err
+
+    def test_the_env_file_is_recorded_in_the_log(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Which variables a run took from a file is exactly what a later
+        incident wants from the journal, so it is logged before the run can
+        fail -- here, against a config that fails during wiring.
+
+        Logged rather than printed, and after configure_logging, so it lands in
+        the journal under systemd instead of only on a terminal nobody kept.
+        """
+        path = tmp_path / "room.toml"
+        path.write_text(
+            '[companion]\ntransport = "tcp"\nhost = "127.0.0.1"\n\n'
+            '[room.lobby]\nname = "Lobby"\nallow_unknown = "read_write"\n\n'
+            '[room.ops]\nname = "Ops"\nallow_unknown = "read_write"\n'
+            'key_file = "lobby.key"\n',
+            encoding="utf-8",
+        )
+        env_path = write_env_file(tmp_path, "MESHELLE_LOG__LEVEL=info\n")
+
+        with caplog.at_level(logging.INFO):
+            assert main(["run", "--config", str(path)]) == 1
+
+        assert str(env_path) in caplog.text
+        assert "1 variable" in caplog.text
+
+    def test_a_loose_env_file_mode_is_logged_as_a_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A run is not refused over it, but it must not be silent either --
+        the journal is where an operator finds out the file needs chmod."""
+        path = tmp_path / "room.toml"
+        path.write_text(
+            '[companion]\ntransport = "tcp"\nhost = "127.0.0.1"\n\n'
+            '[room.lobby]\nname = "Lobby"\nallow_unknown = "read_write"\n\n'
+            '[room.ops]\nname = "Ops"\nallow_unknown = "read_write"\n'
+            'key_file = "lobby.key"\n',
+            encoding="utf-8",
+        )
+        write_env_file(tmp_path, "MESHELLE_LOG__LEVEL=info\n").chmod(0o644)
+
+        with caplog.at_level(logging.WARNING):
+            main(["run", "--config", str(path)])
+
+        assert "chmod 600" in caplog.text
 
     def test_run_reports_a_config_failure_before_touching_anything(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
