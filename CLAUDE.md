@@ -3,8 +3,11 @@
 A MeshCore room server. The companion node is a **bare radio modem**, not a peer —
 meshelle owns the mesh endpoint and every room identity.
 
-**Read `HANDOFF.md` first.** It has current phase state, settled decisions, the
-known traps, and the Phase 6 spec. Do not re-derive what is already in there.
+**Read `HANDOFF.md` first.** It has current phase state, settled decisions and
+the known traps. Do not re-derive what is already in there.
+
+All eight phases are complete. What remains is verification on real hardware
+(`HANDOFF.md` §11) and whatever that turns up.
 
 # Bash commands
 
@@ -59,6 +62,8 @@ known traps, and the Phase 6 spec. Do not re-derive what is already in there.
 - `~/src/meshcore-refs/meshcore-pi` is reference only, never a dependency.
 - `docs/payloads.md` is wrong about the PATH payload's inner `path_len` — it uses
   the outer packed encoding. `Mesh::createPathReturn` wins.
+- `docs/PROTOCOL-NOTES.md` records every layout meshelle relies on, with its
+  firmware citation. Update it when a constant changes.
 - `asyncio.TaskGroup` wraps child exceptions in an `ExceptionGroup`; match with
   `except*` and re-raise the leaf.
 - Frames cap at 176 bytes in both directions (`MAX_FRAME_SIZE`).

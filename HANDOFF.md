@@ -4,7 +4,7 @@ Read this first. It carries the context that is **expensive to re-derive** and t
 decisions that should **not be relitigated**. Everything else is in the code, which
 is heavily commented on purpose — the *why* lives next to the *what*.
 
-Last updated: Phase 7 complete (2026-09-10).
+Last updated: Phase 8 complete — all phases done (2026-09-10).
 
 ---
 
@@ -37,12 +37,13 @@ documented spelling the code does not read.
 | | |
 |---|---|
 | Branch | `main` (was `master`; renamed, no remote) |
-| Commits | 42, conventional commits |
-| Tests | **887 passing**, ~13s |
+| Commits | 44, conventional commits |
+| Tests | **898 passing**, ~15s |
 | Coverage | **96%** overall |
 | Gate | ruff + ruff format + mypy strict all clean |
 
-**Phases 1–7 are done and committed.** Phase 8 remains.
+**All eight phases are done and committed.** What remains is §11: verification
+on real hardware, which no unit test can stand in for.
 
 ```
 ✅ 1  toolchain + Apache-2.0 licensing
@@ -52,12 +53,15 @@ documented spelling the code does not read.
 ✅ 5  config/     strict schema, loader, line-number diagnostics (1104 lines, 96-98%)
 ✅ 6  mesh/ + room/   the room server itself           (1650 lines, 95-100%)
 ✅ 7  app.py + cli.py + logs.py + paths.py  the wiring   (560 lines, 97-100%)
-⬜ 8  docs         README, config.example.toml, PROTOCOL-NOTES.md  ← NEXT
+✅ 8  docs         README, example config, protocol notes, systemd unit
 ```
 
-Everything runs. `meshelle run` hosts the configured rooms; `check-config`,
-`keygen`, `doctor` and `db` are all implemented. What is left is documentation
-and the on-hardware verification in §10, which no unit test can stand in for.
+Everything runs and everything is documented. `meshelle run` hosts the
+configured rooms; `check-config`, `keygen`, `doctor` and `db` are implemented;
+the README, `config.example.toml`, `docs/PROTOCOL-NOTES.md`,
+`docs/DEPENDENCIES.md` and `packaging/meshelle.service` all ship.
+
+**Next: §11.** Nothing here has touched a radio.
 
 ---
 
@@ -409,12 +413,38 @@ in `tests/test_app.py::TestSignals` — raised at the process — because a test
 that called `request_stop()` directly would pass with no handler installed at
 all, and the first `systemctl reload` would be what found out.
 
-## 10. Phase 8 — docs
+## 10. Phase 8 — docs (done)
 
-README (credit meshcore-pi as prior art), `config.example.toml`,
-`docs/PROTOCOL-NOTES.md` recording byte layouts with firmware line references,
-and a record of dependency licences. A systemd unit file is worth including now
-that `SIGHUP` and `SIGTERM` both mean something.
+```
+README.md                     what it is, why, quickstart, the CLI, the console
+config.example.toml           commented in full; the file operators copy
+docs/PROTOCOL-NOTES.md        every byte layout, with its firmware citation
+docs/DEPENDENCIES.md          licence record; all permissive, no copyleft
+packaging/meshelle.service    systemd unit, ExecReload=SIGHUP, hardened
+tests/test_docs.py            the drift guard
+```
+
+**Documentation drift is silent, so three claims are tested rather than
+trusted** (`tests/test_docs.py`):
+
+- `config.example.toml` validates as shipped, and carries a *working* instance
+  of each feature it documents — a commented-out example is not exercised by
+  anything. It uses `env:` for its passwords on purpose, so it ships no working
+  password and an operator who forgets the variable gets an error naming it.
+- Every subcommand the README's table promises still exists, and every relative
+  link in it resolves.
+- Every direct dependency in `pyproject.toml` appears in `docs/DEPENDENCIES.md`.
+  A dependency added without recording its licence is precisely the omission
+  that record exists to prevent — the same reasoning as the licence-header test.
+
+`PROTOCOL-NOTES.md` is the place to look before touching `proto/`. It carries
+the two places MeshCore's published docs are wrong (traps #5 and #10) and the
+one thing they omit (trap #7), each with the firmware source that settles it.
+
+Claims in the README were checked against the firmware rather than memory:
+`MAX_CLIENTS 20` is `ClientACL.h:37`, `MAX_UNSYNCED_POSTS 32` is
+`simple_room_server/MyMesh.h:69`. Both are `#ifndef` defaults, and the README
+says so.
 
 ## 11. Verification on real hardware
 
