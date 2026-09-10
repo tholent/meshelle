@@ -4,7 +4,7 @@ Read this first. It carries the context that is **expensive to re-derive** and t
 decisions that should **not be relitigated**. Everything else is in the code, which
 is heavily commented on purpose — the *why* lives next to the *what*.
 
-Last updated: Phase 8 complete — all phases done (2026-09-10).
+Last updated: 2026-09-10 — all phases done; `.env` support added on top.
 
 ---
 
@@ -37,8 +37,8 @@ documented spelling the code does not read.
 | | |
 |---|---|
 | Branch | `main` (was `master`; renamed, no remote) |
-| Commits | 44, conventional commits |
-| Tests | **898 passing**, ~15s |
+| Commits | 44, conventional commits (this work is uncommitted) |
+| Tests | **991 passing**, ~15s |
 | Coverage | **96%** overall |
 | Gate | ruff + ruff format + mypy strict all clean |
 
@@ -60,6 +60,10 @@ Everything runs and everything is documented. `meshelle run` hosts the
 configured rooms; `check-config`, `keygen`, `doctor` and `db` are implemented;
 the README, `config.example.toml`, `docs/PROTOCOL-NOTES.md`,
 `docs/DEPENDENCIES.md` and `packaging/meshelle.service` all ship.
+
+Since then, one addition on top of the finished build: **`.env` support**
+(`config/dotenv.py`), so `env:NAME` password indirection has somewhere to
+read from on a host that is not running under systemd. See §5 and §13.
 
 **Next: §11.** Nothing here has touched a radio.
 
@@ -169,6 +173,26 @@ source file. The highest-value files in the firmware repo:
   only when the password field is blank (`MyMesh.cpp:337`), so a demoted member
   who still knows the admin password stays an admin. meshelle checks the member
   list first, which is what makes a demotion in the config actually demote.
+- **The `.env` parser is ours, not a dependency.** The format is small, and the
+  two places it must diverge from python-dotenv are exactly the places the
+  libraries disagree with each other: no `$` interpolation (a password
+  truncated at its `$` fails as "wrong password"), and a malformed or
+  duplicated line raises instead of being skipped.
+- **The `.env` is not a config layer.** It writes into `os.environ` before the
+  loader runs, and only where a name is not already set. The real environment
+  wins, so an explicit `MESHELLE_*=… meshelle run` is never undone by a stale
+  file. Adding a fourth precedence layer would have meant re-deriving the
+  merge order that §5 already settled.
+- **A reload owns what it set.** `Application._reload_env_file` drops the
+  variables the previous read applied before re-reading. Without that, a line
+  *deleted* from the file leaves its value live in `os.environ` for the life
+  of the process — a revoked password that still works, which is precisely
+  what an operator reloads to stop. Two tests in `TestEnvFileReload` fail if
+  the `owned=` argument is dropped.
+- **A loose file mode warns, it does not refuse.** Unlike `load_identity`: a
+  `.env` may hold nothing secret, a password is rotatable where a leaked room
+  key is not, and exiting 1 over a port number would train operators to
+  ignore `doctor`.
 - **Flooded replies go out un-scoped**, not with the request's transport codes
   mirrored. See trap #10 — mirroring them is worse than sending none.
 - **Waiting is part of the `Clock` interface.** Both room loops and the scheduler
@@ -485,3 +509,55 @@ uv run meshelle run          --config room.toml --log-level debug
   attaching it to a `Dispatcher` mid-flight, and tearing one down without
   abandoning what it owes its clients. A restart is cheap; this is not.
 - If you want this file auto-loaded each run, reference it from a `CLAUDE.md`.
+
+---
+
+## 13. The env file (added after phase 8)
+
+`env:NAME` password indirection existed from phase 5, but the only places to
+*put* the variable were systemd's `EnvironmentFile=` or one operator's shell.
+`config/dotenv.py` closes that gap.
+
+```
+config/dotenv.py   parse, apply, and describe a .env          (280 lines)
+```
+
+**Discovery order**, in `cli.find_env_file`: `--env-file`, then
+`$MESHELLE_ENV_FILE`, then `.env` beside the config file. A file named by the
+flag or the variable must exist; a default `.env` need not.
+
+**Never the working directory.** Same rule, same reason as `paths.anchor`: a
+service runs with `WorkingDirectory=/`, so a `.env` found in the CWD would apply
+when the operator tested by hand and vanish once it was installed properly. That
+presents as a password that works only in the terminal.
+
+**Ordering.** The config file is located *first*, because until it is known
+there is nowhere to look for a `.env`. So `MESHELLE_CONFIG` set inside a `.env`
+cannot choose the config — that is a loop, not an oversight.
+
+**Blame.** `DotenvResult.sources` maps each variable to `path:line`, and
+`loader.env_origins` threads it through, so a validation error about a value the
+file supplied cites the line rather than only naming a variable the reader's
+shell does not have set.
+
+### What is covered
+
+| | |
+|---|---|
+| `tests/config/test_dotenv.py` | 56 tests — parsing, quoting, the reload/`owned` semantics, the mode warning |
+| `tests/test_cli.py::TestFindEnvFile` etc. | discovery, precedence, and both diagnostics |
+| `tests/test_app.py::TestEnvFileReload` | rotation, revocation, and a refused reload |
+| `tests/test_docs.py::TestEnvFileDocs` | the README and example config against the constants |
+
+`tests/conftest.py::_isolate_environment` is autouse and new. Loading a `.env`
+is *meant* to write to `os.environ`, so without it a CLI test leaks its
+variables into every test that runs afterwards, and `monkeypatch` cannot undo
+what it did not set.
+
+### Known rough edge
+
+A reload whose `.env` parses but whose *config* then fails leaves
+`self._env_file` describing the previous read while `os.environ` reflects the
+new one. It self-heals on the next reload (the stale `owned` names are simply
+popped again) and no value is wrong in the meantime, but the two are briefly
+out of step. Worth knowing before reading that code and concluding it is a bug.
