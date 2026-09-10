@@ -23,3 +23,8 @@ data/
 *.db
 *.db-wal
 *.db-shm
+
+# local app files
+meshelle.toml
+config.toml
+.env
