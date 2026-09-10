@@ -17,9 +17,14 @@
 """Load and validate configuration.
 
 Precedence is **CLI > environment > file > defaults**, implemented as an explicit
-deep merge of plain dicts before a single validation pass. Doing the merge
-ourselves rather than layering settings sources keeps the ordering obvious and
-makes it directly testable, which matters more here than saving a few lines.
+deep merge of plain dicts before a single validation pass. A ``.env`` file is not
+a layer of its own: :mod:`meshelle.config.dotenv` puts its variables into the
+environment before this runs, and only where the environment does not already
+have them.
+
+Doing the merge ourselves rather than layering settings sources keeps the
+ordering obvious and makes it directly testable, which matters more here than
+saving a few lines.
 
 The file uses TOML's natural shapes -- ``[room.lobby]`` and
 ``[[room.lobby.member]]`` -- which are mapped to the model's ``rooms`` and
@@ -151,12 +156,19 @@ def env_overrides(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     return overrides
 
 
-def env_origins(environ: Mapping[str, str] | None = None) -> dict[KeyPath, str]:
+def env_origins(
+    environ: Mapping[str, str] | None = None,
+    sources: Mapping[str, str] | None = None,
+) -> dict[KeyPath, str]:
     """Which environment variable set each path.
 
     Needed so an error about an overridden value names the variable instead of a
     line in the file, which would send the reader to edit something that is not
     actually in effect.
+
+    ``sources`` maps a variable name to where it was defined -- an env file and
+    its line -- for the same reason: told only the variable's name, an operator
+    whose shell does not have it set has nowhere to go and look.
     """
     source = os.environ if environ is None else environ
     origins: dict[KeyPath, str] = {}
@@ -166,7 +178,8 @@ def env_origins(environ: Mapping[str, str] | None = None) -> dict[KeyPath, str]:
             continue
         path = tuple(part.lower() for part in name[len(ENV_PREFIX) :].split(ENV_NESTING) if part)
         if path:
-            origins[path] = name
+            defined_at = (sources or {}).get(name)
+            origins[path] = f"{name} ({defined_at})" if defined_at else name
 
     return origins
 
@@ -408,6 +421,7 @@ def build_settings(
     overrides: Mapping[str, Any] | None = None,
     source: str = "configuration",
     source_map: SourceMap | None = None,
+    env_sources: Mapping[str, str] | None = None,
 ) -> Settings:
     """Merge every layer and validate, in precedence order.
 
@@ -417,11 +431,12 @@ def build_settings(
         overrides: highest-precedence values, normally assembled from CLI flags.
         source: what to name in error messages, usually the config file path.
         source_map: line numbers for the config file, so errors can cite them.
+        env_sources: variable name -> where it was defined, from an env file.
     """
     merged: dict[str, Any] = dict(file_data or {})
     merged = deep_merge(merged, env_overrides(environ))
 
-    origins: dict[KeyPath, str] = dict(env_origins(environ))
+    origins: dict[KeyPath, str] = dict(env_origins(environ, env_sources))
     if overrides:
         merged = deep_merge(merged, overrides)
         # Flags are the highest layer, so they win the blame too.
@@ -445,6 +460,7 @@ def load_settings(
     *,
     environ: Mapping[str, str] | None = None,
     overrides: Mapping[str, Any] | None = None,
+    env_sources: Mapping[str, str] | None = None,
 ) -> Settings:
     """Load configuration from ``path``, then environment, then ``overrides``."""
     config_file = read_config_file(path) if path is not None else None
@@ -454,4 +470,5 @@ def load_settings(
         overrides=overrides,
         source=str(path) if path is not None else "configuration",
         source_map=config_file.source_map if config_file is not None else None,
+        env_sources=env_sources,
     )
