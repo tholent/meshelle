@@ -33,13 +33,15 @@ real.
 
 from __future__ import annotations
 
+import logging
 import shutil
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import pytest
 
+from meshelle.logs import shutdown_logging
 from meshelle.store.db import Store
 from meshelle.store.migrate import upgrade_to_head
 
@@ -48,6 +50,24 @@ REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 WAL_SIDECARS = ("-wal", "-shm")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_logging() -> Iterator[None]:
+    """Undo any logging a test configured.
+
+    ``configure_logging`` installs handlers on the *root* logger, so a test that
+    runs a CLI command leaves them attached for the rest of the session -- and
+    the next test asserting on captured output sees every record two or three
+    times. Autouse because the leak is invisible in the test that causes it and
+    only fails the ones that come after.
+    """
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    yield
+    shutdown_logging()
+    root.handlers[:] = handlers
+    root.setLevel(level)
 
 
 @pytest.fixture(scope="session")
