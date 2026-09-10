@@ -8,3 +8,18 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Runtime state: room identities and the post database never belong in git
+data/
+*.key
+*.db
+*.db-wal
+*.db-shm
