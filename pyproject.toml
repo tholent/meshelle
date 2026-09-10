@@ -19,7 +19,6 @@ dependencies = [
     "alembic>=1.13",
     "cryptography>=43",
     "pydantic>=2.8",
-    "pydantic-settings>=2.4",
     "pyserial-asyncio-fast>=0.16",
     "sqlalchemy>=2.0",
 ]
