@@ -367,7 +367,18 @@ class TestErrorMessages:
 class TestReadConfigFile:
     def test_reads_valid_toml(self, tmp_path: Path) -> None:
         path = write_config(tmp_path, MINIMAL_TOML)
-        assert read_config_file(path)["companion"]["port"] == "/dev/ttyUSB0"
+        config = read_config_file(path)
+
+        assert config.data["companion"]["port"] == "/dev/ttyUSB0"
+        assert config.path == path
+
+    def test_retains_the_text_for_diagnostics(self, tmp_path: Path) -> None:
+        """The text is what lets an error cite a line number."""
+        path = write_config(tmp_path, MINIMAL_TOML)
+        config = read_config_file(path)
+
+        assert config.text == MINIMAL_TOML
+        assert config.source_map.locate(("companion", "port")) is not None
 
     def test_reports_a_missing_file(self, tmp_path: Path) -> None:
         with pytest.raises(ConfigError, match="cannot read config file"):
@@ -480,3 +491,124 @@ advert_flood_interval = "never"
             },
         )
         assert settings.rooms["lobby"].allow_unknown is UnknownPolicy.GUEST
+
+
+BASE_TOML = """[companion]
+port = "/dev/ttyUSB0"
+
+[room.lobby]
+allow_unknown = "guest"
+"""
+
+
+class TestLineNumbers:
+    """Errors must cite the line to edit, or name the override actually in effect.
+
+    This is the one thing strictyaml would have supplied for free; tomllib discards
+    position information, so it is recovered by scanning the original text.
+    """
+
+    def _error(self, tmp_path: Path, text: str, **kwargs: Any) -> str:
+        path = write_config(tmp_path, text)
+        with pytest.raises(ConfigError) as excinfo:
+            load_settings(path, **{"environ": {}, **kwargs})
+        return str(excinfo.value)
+
+    def test_cites_the_line_of_an_unknown_key(self, tmp_path: Path) -> None:
+        message = self._error(
+            tmp_path,
+            "# a comment\n"
+            "[companion]\n"
+            "prot = '/dev/x'\n"
+            "port = '/dev/x'\n"
+            "\n"
+            "[room.lobby]\n"
+            "allow_unknown = 'guest'\n",
+        )
+        assert ":3: unknown key 'prot'" in message
+
+    def test_cites_the_line_of_a_bad_value(self, tmp_path: Path) -> None:
+        message = self._error(
+            tmp_path,
+            BASE_TOML + "advert_flood_interval = 'soon'\n",
+        )
+        assert ":6: room.lobby.advert_flood_interval" in message
+
+    def test_cites_the_right_member_of_an_array(self, tmp_path: Path) -> None:
+        message = self._error(
+            tmp_path,
+            BASE_TOML
+            + "\n[[room.lobby.member]]\n"
+            + f"pubkey = '{KEY_A}'\n"
+            + "role = 'admin'\n"
+            + "\n[[room.lobby.member]]\n"
+            + "pubkey = 'too-short'\n"
+            + "role = 'guest'\n",
+        )
+        assert ":12: room.lobby.member.[1].pubkey" in message
+
+    def test_is_not_fooled_by_a_key_inside_a_multiline_string(self, tmp_path: Path) -> None:
+        """A welcome message may contain anything, including 'key = value' text."""
+        message = self._error(
+            tmp_path,
+            BASE_TOML
+            + 'welcome = """\n'
+            + 'advert_flood_interval = "not this one"\n'
+            + '"""\n'
+            + "advert_flood_interval = 'soon'\n",
+        )
+        assert ":9: room.lobby.advert_flood_interval" in message
+
+    def test_an_environment_override_is_blamed_on_the_variable(self, tmp_path: Path) -> None:
+        """Citing a file line would send the reader to edit a value that is not
+        the one in effect."""
+        message = self._error(
+            tmp_path,
+            "[companion]\n"
+            "port = '/dev/x'\n"
+            "\n"
+            "[log]\n"
+            "level = 'info'\n"
+            "\n"
+            "[room.lobby]\n"
+            "allow_unknown = 'guest'\n",
+            environ={"MESHELLE_LOG__LEVEL": "verbose"},
+        )
+        assert "MESHELLE_LOG__LEVEL:" in message
+        assert ":5:" not in message, "the file's own level line is not the problem"
+
+    def test_a_cli_override_is_blamed_on_the_command_line(self, tmp_path: Path) -> None:
+        message = self._error(
+            tmp_path,
+            "[companion]\n"
+            "port = '/dev/x'\n"
+            "baud_rate = 115200\n"
+            "\n"
+            "[room.lobby]\n"
+            "allow_unknown = 'guest'\n",
+            overrides={"companion": {"baud_rate": "fast"}},
+        )
+        assert "command line: companion.baud_rate" in message
+
+    def test_an_unrelated_override_does_not_steal_the_blame(self, tmp_path: Path) -> None:
+        """Only the overridden path loses its line number, not its siblings."""
+        message = self._error(
+            tmp_path,
+            BASE_TOML + "advert_flood_interval = 'soon'\n",
+            environ={"MESHELLE_COMPANION__PORT": "/dev/other"},
+        )
+        assert ":6: room.lobby.advert_flood_interval" in message
+
+    def test_falls_back_to_the_file_name_when_there_is_no_line(self, tmp_path: Path) -> None:
+        """A whole-config invariant has no single line to point at."""
+        message = self._error(tmp_path, "[companion]\nport = '/dev/x'\n")
+
+        assert "no rooms are configured" in message
+        assert "meshelle.toml" in message
+
+    def test_an_inline_table_reports_its_own_line(self, tmp_path: Path) -> None:
+        message = self._error(
+            tmp_path,
+            BASE_TOML + "passwords = { administrator = 'pw' }\n",
+        )
+        assert ":6: unknown key 'administrator'" in message
