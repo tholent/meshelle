@@ -457,6 +457,117 @@ class TestRetention:
         assert list(session.scalars(select(Post))) == []
 
 
+class TestClientRetention:
+    """Forgetting clients, and the two things that must stop it.
+
+    Nothing else removes a client row, so a room whose ``allow_unknown`` grants
+    a role gains one per stranger and never loses it. These tests pin the policy
+    and, more importantly, the cases it is not allowed to apply to.
+    """
+
+    def _seen(self, session: Session, room_id: int, key: bytes, when: int, since: int = 0) -> None:
+        repo.record_login(
+            session,
+            room_id,
+            key,
+            role=Permission.READ_WRITE,
+            sender_timestamp=1,
+            sync_since=since,
+            now=when,
+            reset_out_path=False,
+        )
+
+    def test_forgets_a_client_idle_past_the_cutoff(self, session: Session, room_id: int) -> None:
+        self._seen(session, room_id, ALICE, when=100)
+        self._seen(session, room_id, BOB, when=900)
+
+        assert repo.prune_clients(session, room_id, older_than=500) == [ALICE]
+        assert [c.public_key for c in repo.list_clients(session, room_id)] == [BOB]
+
+    def test_the_cutoff_is_exclusive(self, session: Session, room_id: int) -> None:
+        """A client seen exactly at the cutoff has not yet been idle that long.
+
+        An inclusive test would forget a client one second early, which matters
+        only at the boundary but is the kind of off-by-one that reads as "it
+        sometimes forgets people" in a bug report.
+        """
+        self._seen(session, room_id, ALICE, when=500)
+
+        assert repo.prune_clients(session, room_id, older_than=500) == []
+
+    def test_returns_the_keys_not_a_count(self, session: Session, room_id: int) -> None:
+        """The caller holds the matching in-memory sessions and must drop the
+        same ones. A count would let the two disagree, and a live session for a
+        deleted row re-creates it on the client's next packet -- so the policy
+        would never make progress."""
+        self._seen(session, room_id, ALICE, when=100)
+        self._seen(session, room_id, BOB, when=100)
+
+        assert set(repo.prune_clients(session, room_id, older_than=500)) == {ALICE, BOB}
+
+    def test_an_owed_post_does_not_save_an_idle_client(
+        self, session: Session, room_id: int
+    ) -> None:
+        """Idleness is the whole test, and this is the case that proves it.
+
+        Sparing any client still owed a post sounds prudent and is close to a
+        no-op: with a 30-day post retention almost every idle client is owed
+        something, so the policy would never fire. It is safe to forget them
+        because sync position does not live in this row -- the client's own
+        login carries the timestamp of the newest post it holds, and
+        ``record_login`` takes that claim verbatim.
+        """
+        repo.add_post(session, room_id, ALICE, "unread by bob", 700)
+        self._seen(session, room_id, BOB, when=100, since=600)
+
+        assert repo.prune_clients(session, room_id, older_than=500) == [BOB]
+
+    def test_keep_spares_a_client_whatever_its_idleness(
+        self, session: Session, room_id: int
+    ) -> None:
+        """``keep`` carries state the database cannot see: a push already on the
+        air. Deleting that row now strands the ACK with nothing to advance."""
+        self._seen(session, room_id, ALICE, when=100)
+        self._seen(session, room_id, BOB, when=100)
+
+        dropped = repo.prune_clients(session, room_id, older_than=500, keep=frozenset({ALICE}))
+
+        assert dropped == [BOB]
+        assert [c.public_key for c in repo.list_clients(session, room_id)] == [ALICE]
+
+    def test_leaves_other_rooms_alone(self, session: Session, room_id: int) -> None:
+        other = repo.ensure_room(session, "ops", OTHER_ROOM_KEY, now=1000).id
+        self._seen(session, room_id, ALICE, when=100)
+        self._seen(session, other, ALICE, when=100)
+
+        repo.prune_clients(session, room_id, older_than=500)
+
+        assert [c.public_key for c in repo.list_clients(session, other)] == [ALICE]
+
+    def test_forgetting_a_client_releases_the_posts_it_was_pinning(
+        self, session: Session, room_id: int
+    ) -> None:
+        """The interaction that makes this worth having.
+
+        ``prune_posts`` floors deletion at the lowest ``sync_since`` in the
+        room, so a long-dead client pins every post above its cursor and
+        ``max_posts`` never binds. Pruning clients first is what releases them.
+
+        Bob is the client that posted and then left. His cursor never moved past
+        his first post, so it floors the whole room even though he is long gone.
+        """
+        for index in range(5):
+            repo.add_post(session, room_id, BOB, f"post {index}", 100 + index)
+        self._seen(session, room_id, BOB, when=10, since=100)
+        self._seen(session, room_id, CAROL, when=900, since=104)
+
+        assert repo.prune_posts(session, room_id, older_than=999) == 1, "Bob pins the rest"
+
+        repo.prune_clients(session, room_id, older_than=500)
+
+        assert repo.prune_posts(session, room_id, older_than=999) == 4
+
+
 class TestCounters:
     def test_increments_from_nothing(self, session: Session, room_id: int) -> None:
         assert repo.increment_counter(session, room_id, "posted") == 1

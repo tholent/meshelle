@@ -368,6 +368,62 @@ def list_clients(session: Session, room_id: int) -> list[Client]:
     )
 
 
+def prune_clients(
+    session: Session, room_id: int, *, older_than: int, keep: frozenset[bytes] = frozenset()
+) -> list[bytes]:
+    """Forget clients idle since before ``older_than``. Returns the keys dropped.
+
+    A row is created for every key that logs in successfully and nothing else
+    removes one, so a room whose ``allow_unknown`` grants a role -- or whose
+    password has leaked -- accumulates a permanent row per stranger, and
+    :func:`list_clients` derives a shared secret for every one of them at each
+    start. Radio bandwidth makes that slow rather than sudden, which is exactly
+    why it needs a policy: it never recovers on its own.
+
+    **Idleness is the whole test, deliberately.** An earlier draft also spared
+    any client still owed a post, which sounds prudent and is in fact close to a
+    no-op: with a 30-day post retention almost every idle client is owed
+    something, so the policy would never fire. It is unnecessary as well as
+    ineffective, because a client's sync position does not live here. Its own
+    login carries the timestamp of the newest post it holds, and
+    :func:`record_login` takes that claim verbatim -- so a forgotten client
+    resumes exactly where it left off rather than re-reading the room.
+
+    What is genuinely lost is the replay floor: ``last_timestamp`` goes with the
+    row, so a login captured before the client was forgotten could be replayed
+    once. It grants only the role the config already grants that key, and the
+    client's next real login re-arms the floor. Weighed against a table that
+    grows without bound, that is the better trade -- but it is the reason the
+    default is 90 days rather than something brisk.
+
+    ``keep`` names keys that must survive whatever their idleness, for state
+    this function cannot see: the caller's in-flight pushes. Deleting a row
+    mid-push would strand the ACK with nothing to advance.
+
+    Call this **before** :func:`prune_posts` in the same transaction, since that
+    function floors deletion at the minimum ``sync_since`` in the room: a
+    long-dead client pins every post above its cursor, and removing it first is
+    what lets the retention policy actually apply.
+    """
+    doomed = [
+        key
+        for key in session.scalars(
+            select(Client.public_key).where(
+                Client.room_id == room_id, Client.last_activity < older_than
+            )
+        )
+        if key not in keep
+    ]
+    if not doomed:
+        return []
+
+    session.execute(delete(Client).where(Client.room_id == room_id, Client.public_key.in_(doomed)))
+    logger.info(
+        "room %d: forgot %d client(s) idle since before %d", room_id, len(doomed), older_than
+    )
+    return doomed
+
+
 def list_admin_clients(session: Session, room_id: int) -> list[Client]:
     """Admins only, for REQ_TYPE_GET_ACCESS_LIST."""
     return list(
