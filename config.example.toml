@@ -69,10 +69,16 @@ advert_flood_interval = "6h"  # how often to announce across the whole mesh
 advert_local_interval = "30m" # zero-hop announce, for immediate neighbours
 post_retention = "30d"        # delete posts older than this; "never" to keep
 max_posts = 5000              # per room; omit or "unlimited" for no cap
+client_retention = "90d"      # forget a client idle this long; "never" to keep
 
 # Retention policies are independent reasons to delete: a post goes if it is
 # too old OR past the count. Neither ever deletes a post a known client has not
 # been sent yet.
+#
+# client_retention exists because nothing else removes a client row: a room with
+# allow_unknown set gains one per stranger and keeps it forever. Forgetting one
+# is cheap — a returning client's own login says which posts it already holds,
+# so it resumes where it left off rather than re-reading the room.
 #
 # Durations accept "30m", "6h", "1h30m", "7d", "2w", a plain number of seconds,
 # or "never"/"forever" to disable.

@@ -115,6 +115,7 @@ data_dir = "data"
 [defaults]                       # inherited by every room
 post_retention = "30d"
 max_posts = 5000
+client_retention = "90d"
 
 [room.lobby]
 name = "The Lobby"
@@ -261,6 +262,13 @@ that the app offers you a compose box.
 - **Retention policies are independent.** `post_retention` and `max_posts` are
   separate reasons to delete, combined with OR. Neither ever deletes a post a
   known client has not yet been sent.
+- **Clients are forgotten when idle.** Nothing else removes a client row, so a
+  room with `allow_unknown` set would otherwise gain one per stranger and keep
+  it forever, reloading all of them at every start. `client_retention` (90 days
+  by default) bounds that. It costs a forgotten client nothing on return: its
+  own login carries the timestamp of the newest post it holds, so it resumes
+  where it left off. What it does lose is its replay floor, which is why the
+  default is generous rather than brisk.
 - **A restart resumes mid-sync.** Clients are rehydrated from the database at
   startup, so owed posts keep flowing without waiting for each client to log in
   again. A role earned by *password* is not restored — the password is never

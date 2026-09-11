@@ -37,8 +37,8 @@ documented spelling the code does not read.
 | | |
 |---|---|
 | Branch | `main` (was `master`; renamed, no remote) |
-| Commits | 44, conventional commits (this work is uncommitted) |
-| Tests | **991 passing**, ~15s |
+| Commits | 64, conventional commits |
+| Tests | **1001 passing**, ~16s |
 | Coverage | **96%** overall |
 | Gate | ruff + ruff format + mypy strict all clean |
 
@@ -297,6 +297,22 @@ source file. The highest-value files in the firmware repo:
    it is by default — so a busy room grows past its declared cap. The sync floor
    is still ANDed: a post no client has been sent is never deleted, so a strict
    `max_posts` legitimately does nothing while someone is behind.
+
+11b. **Client retention is idleness only, on purpose.** `prune_clients` was
+   drafted with a second guard sparing any client still owed a post. That
+   sounds prudent and is close to a no-op: with a 30-day `post_retention`
+   almost every idle client is owed something, so the policy would never fire.
+   It is also unnecessary — sync position does not live in the client row.
+   `record_login` takes `sync_since` from the client's own login verbatim
+   (`repo.py`), so a forgotten client resumes exactly where it left off. What a
+   forgotten client *does* lose is `last_timestamp`, its replay floor, which is
+   the real cost and the reason the default is 90 days. The one guard that
+   remains is `keep`, naming clients with a push in flight, which the database
+   cannot see.
+
+   Prune clients **before** posts in the same transaction: `prune_posts` floors
+   deletion at the room's minimum `sync_since`, so a long-dead client pins every
+   post above its cursor and `max_posts` never binds.
 
 12. **Never share a key between two rooms, or with the companion node.** Two state
    machines answering one destination hash produce conflicting replies, duplicate
