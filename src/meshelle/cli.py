@@ -328,7 +328,8 @@ def _describe_room(slug: str, room: RoomSettings, key_path: Path | None) -> list
 
     retention = "forever" if room.post_retention is None else f"{room.post_retention}s"
     cap = "unlimited" if room.max_posts is None else str(room.max_posts)
-    lines.append(f"    retention: {retention}, at most {cap} posts")
+    clients = "forever" if room.client_retention is None else f"{room.client_retention}s"
+    lines.append(f"    retention: {retention}, at most {cap} posts; clients {clients}")
 
     flood = "off" if not room.advert_flood_interval else f"{room.advert_flood_interval}s"
     local = "off" if not room.advert_local_interval else f"{room.advert_local_interval}s"

@@ -383,6 +383,18 @@ class TestCheckConfig:
         assert "members: 1 (admin)" in out
         assert "passwords: admin" in out
 
+    def test_reports_both_retention_policies(
+        self, config: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Client retention silently deletes rows, so an operator has to be able
+        to see what it is set to without reading the defaults out of the source.
+        """
+        assert main(["check-config", "--config", str(config)]) == 0
+
+        line = next(row for row in capsys.readouterr().out.splitlines() if "retention:" in row)
+        assert "at most 5000 posts" in line
+        assert f"clients {90 * 86400}s" in line
+
     def test_creates_no_key_file(self, config: Path) -> None:
         """A command run to find out what is missing must not fix it silently."""
         main(["check-config", "--config", str(config)])
