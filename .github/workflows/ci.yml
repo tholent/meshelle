@@ -1,0 +1,68 @@
+# The four gates from CLAUDE.md, run on every push and pull request.
+#
+# They are listed here in the same order and with the same commands as the
+# local workflow, so CI and a developer's checkout cannot disagree about what
+# "passing" means. A gate that only exists in one of the two places is a gate
+# that silently stops being enforced.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # A second push to the same branch makes the first run's answer irrelevant.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: lint, types, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # --all-extras so transport/ble.py is importable and type-checked. Without
+      # it mypy skips the bleak paths and the BLE transport rots unnoticed.
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format
+        run: uv run ruff format --check .
+
+      - name: mypy
+        run: uv run mypy
+
+      - name: pytest
+        run: uv run pytest -q
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    # Advisory: a new CVE against a pinned dependency is news, but it must not
+    # be able to turn every unrelated pull request red until someone triages it.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      # Audits the resolved tree from uv.lock, so this reports what a deployment
+      # would actually install rather than what pyproject.toml permits.
+      - name: pip-audit
+        run: uvx pip-audit --strict

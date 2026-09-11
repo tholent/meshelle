@@ -1,0 +1,20 @@
+# docs/DEPENDENCIES.md records a verified version per dependency and is checked
+# for completeness by tests/test_docs.py. Nothing, though, notices when one of
+# those pins goes stale -- so the licence record slowly stops describing what a
+# deployment actually installs. These updates are what keeps it honest.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "build"
+
+  # The CI workflow pins actions by major version; this keeps those moving.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "ci"
