@@ -319,6 +319,17 @@ class RoomDefaults(StrictModel):
     max_posts: int | None = Field(default=5000, gt=0)
     """Keep at most this many posts per room. None is unlimited."""
 
+    client_retention: Duration = 90 * 86400
+    """Forget a client idle this long. None keeps every client forever.
+
+    A row is created for every key that logs in and nothing else removes one, so
+    an open room accumulates strangers permanently and reloads all of them at
+    each start. Generous by default: the cost of forgetting a real client early
+    is that it re-syncs the room's retained history, which is worse than keeping
+    a dead row for a season. A client still owed a post is never forgotten,
+    whatever this says.
+    """
+
     welcome: str | None = None
     """Sent to a client the first time it syncs. Split across messages if long."""
 
