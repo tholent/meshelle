@@ -34,7 +34,7 @@ from meshelle.proto.packet import Datagram, Packet, TextMessage
 from meshelle.store import repo
 from meshelle.store.db import Store
 from tests.fakes.client import FakeClient, PushedPost
-from tests.fakes.room import build_room, drain, room_settings
+from tests.fakes.room import EPOCH, build_room, drain, room_settings
 
 
 async def run_until(
@@ -164,7 +164,7 @@ async def test_a_client_whose_stored_key_is_unusable_is_skipped(store: Store) ->
     """A corrupt row loses one client, not the whole room: every other client's
     sync would otherwise stop at startup."""
     identity = LocalIdentity.generate()
-    await store.run(lambda s: repo.ensure_room(s, "lobby", identity.public_key, now=1))
+    await store.run(lambda s: repo.ensure_room(s, "lobby", identity.public_key, now=EPOCH))
     room_row = await store.run(lambda s: repo.get_room_by_slug(s, "lobby"))
     assert room_row is not None
     good = LocalIdentity.generate()
@@ -177,7 +177,9 @@ async def test_a_client_whose_stored_key_is_unusable_is_skipped(store: Store) ->
             role=Role.READ_WRITE.permission,
             sender_timestamp=1,
             sync_since=0,
-            now=1,
+            # EPOCH, not 1: these clients are current as far as the room's clock
+            # is concerned, so client_retention is not what this test measures.
+            now=EPOCH,
             reset_out_path=False,
         )
 
@@ -187,6 +189,98 @@ async def test_a_client_whose_stored_key_is_unusable_is_skipped(store: Store) ->
     room = await build_room(store, room_settings(), identity=identity)
 
     assert set(room.server.sessions) == {good.public_key}
+    await room.aclose()
+
+
+# -- client retention -------------------------------------------------------
+
+
+async def test_a_client_idle_past_retention_is_not_rehydrated(store: Store) -> None:
+    """Nothing else removes a client row.
+
+    A room whose ``allow_unknown`` grants a role gains one per stranger that
+    ever logs in, keeps it forever, and derives a shared secret for every one of
+    them at each start. Slow, because radio bandwidth is the limit -- but it
+    never recovers on its own, which is what makes it a policy question.
+    """
+    identity = LocalIdentity.generate()
+    await store.run(lambda s: repo.ensure_room(s, "lobby", identity.public_key, now=EPOCH))
+    room_row = await store.run(lambda s: repo.get_room_by_slug(s, "lobby"))
+    assert room_row is not None
+    stale, live = LocalIdentity.generate(), LocalIdentity.generate()
+
+    def remember(key: bytes, when: int) -> Callable[[Session], object]:
+        return lambda s: repo.record_login(
+            s,
+            room_row.id,
+            key,
+            role=Role.READ_WRITE.permission,
+            sender_timestamp=1,
+            sync_since=0,
+            now=when,
+            reset_out_path=False,
+        )
+
+    await store.run(remember(stale.public_key, EPOCH - 200 * 86400))
+    await store.run(remember(live.public_key, EPOCH - 86400))
+
+    room = await build_room(store, room_settings(client_retention="90d"), identity=identity)
+
+    assert set(room.server.sessions) == {live.public_key}
+    remaining = await store.run(lambda s: repo.list_clients(s, room_row.id))
+    assert [c.public_key for c in remaining] == [live.public_key], "the row must go too"
+    await room.aclose()
+
+
+async def test_retention_off_keeps_every_client(store: Store) -> None:
+    """``client_retention = "forever"`` has to actually mean it: an operator who
+    turns the policy off must not find rows disappearing anyway."""
+    identity = LocalIdentity.generate()
+    await store.run(lambda s: repo.ensure_room(s, "lobby", identity.public_key, now=EPOCH))
+    room_row = await store.run(lambda s: repo.get_room_by_slug(s, "lobby"))
+    assert room_row is not None
+    ancient = LocalIdentity.generate()
+    await store.run(
+        lambda s: repo.record_login(
+            s,
+            room_row.id,
+            ancient.public_key,
+            role=Role.READ_WRITE.permission,
+            sender_timestamp=1,
+            sync_since=0,
+            now=1,
+            reset_out_path=False,
+        )
+    )
+
+    room = await build_room(store, room_settings(client_retention="forever"), identity=identity)
+
+    assert set(room.server.sessions) == {ancient.public_key}
+    await room.aclose()
+
+
+async def test_a_forgotten_client_loses_its_live_session_too(store: Store) -> None:
+    """Memory and database have to agree.
+
+    A live session whose row has been deleted re-creates that row on the
+    client's next packet, carrying the sync position with it -- so the policy
+    would delete the same row forever and never make progress.
+    """
+    room = await build_room(store, room_settings(client_retention="30d"))
+    gone = FakeClient(room.identity.public_key, path_to_room=b"\x0d")
+    stays = FakeClient(room.identity.public_key, path_to_room=b"\x0e")
+    for index, client in enumerate((gone, stays)):
+        await room.deliver(client.login(timestamp=1000 + index))
+    assert len(room.server.sessions) == 2
+
+    # Far enough that both are idle, then only `stays` is heard from again.
+    room.clock.advance(40 * 86400)
+    await room.deliver(stays.login(timestamp=2000))
+
+    # A post is the room's live maintenance point, the same one that prunes posts.
+    await room.deliver(stays.post("triggers maintenance", timestamp=2100))
+
+    assert set(room.server.sessions) == {stays.identity.public_key}
     await room.aclose()
 
 

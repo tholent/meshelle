@@ -54,6 +54,7 @@ import logging
 import secrets
 import struct
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session
@@ -104,6 +105,7 @@ from meshelle.room.stats import (
 )
 from meshelle.store import repo
 from meshelle.store.db import Store
+from meshelle.store.models import Client
 
 logger = logging.getLogger(__name__)
 
@@ -213,8 +215,14 @@ class RoomServer:
         return self._settings
 
     @property
-    def sessions(self) -> dict[bytes, ClientSession]:
-        """Live client state, for tests and for the future ``doctor`` command."""
+    def sessions(self) -> Mapping[bytes, ClientSession]:
+        """Live client state, for tests and for the future ``doctor`` command.
+
+        A ``Mapping``, so a reader cannot add or drop a client behind the
+        server's back: membership is owned by ``_login`` and the retention
+        sweep, which keep it in step with the ``clients`` table. The session
+        objects themselves stay mutable -- tests set ``pending_ack`` on one.
+        """
         return self._sessions
 
     # -- lifecycle -----------------------------------------------------------
@@ -226,7 +234,15 @@ class RoomServer:
         until it happened to log in again -- and a client with a working out_path
         may not log in for hours.
         """
-        clients = await self._store.run(lambda s: repo.list_clients(s, self._room_id))
+
+        def load(db: Session) -> list[Client]:
+            # Prune before listing, not after: the rows a retention policy is
+            # about to delete are exactly the ones there is no point deriving a
+            # shared secret for, and an abandoned open room can hold thousands.
+            self._prune_clients(db)
+            return repo.list_clients(db, self._room_id)
+
+        clients = await self._store.run(load)
         for client in clients:
             try:
                 secret = self._identity.shared_secret(client.public_key)
@@ -255,6 +271,28 @@ class RoomServer:
                 last_activity=client.last_activity,
             )
         logger.info("room %s: resumed %d known client(s)", self._slug, len(self._sessions))
+
+    def _prune_clients(self, db: Session) -> list[bytes]:
+        """Apply the client retention policy. Returns the keys forgotten."""
+        retention = self._settings.client_retention
+        if retention is None:
+            return []
+        # A client we are mid-push to is live whatever its last_activity says:
+        # deleting the row now strands the ACK still on its way back to us.
+        in_flight = frozenset(key for key, s in self._sessions.items() if s.pending_ack is not None)
+        return repo.prune_clients(
+            db, self._room_id, older_than=self._clock.now() - retention, keep=in_flight
+        )
+
+    def _forget_sessions(self, public_keys: list[bytes]) -> None:
+        """Drop the in-memory half of clients the database has forgotten.
+
+        Without this the row comes back on the client's next packet, carrying
+        the live session's sync position, and the policy never makes progress.
+        """
+        for public_key in public_keys:
+            if self._sessions.pop(public_key, None) is not None:
+                logger.info("room %s: forgot idle client %s", self._slug, public_key[:4].hex())
 
     def apply_settings(self, settings: RoomSettings) -> None:
         """Adopt reloaded configuration without disturbing sync state.
@@ -544,19 +582,24 @@ class RoomServer:
         retention = self._settings.post_retention
         max_posts = self._settings.max_posts
 
-        def work(db: Session) -> int:
+        def work(db: Session) -> tuple[int, list[bytes]]:
             post_ts = repo.next_post_ts(db, self._room_id, now)
             post = repo.add_post(db, self._room_id, author_public_key, text, post_ts)
             repo.increment_counter(db, self._room_id, COUNTER_POSTED)
+            # Clients first: prune_posts floors deletion at the lowest
+            # sync_since in the room, so a dead client pins every post it never
+            # acknowledged and max_posts would never bite.
+            forgotten = self._prune_clients(db)
             repo.prune_posts(
                 db,
                 self._room_id,
                 older_than=None if retention is None else now - retention,
                 keep_newest=max_posts,
             )
-            return post.post_ts
+            return post.post_ts, forgotten
 
-        post_ts = await self._store.run(work)
+        post_ts, forgotten = await self._store.run(work)
+        self._forget_sessions(forgotten)
         # Hold off pushing so the author's own ACK is not competing with a push
         # for the same airtime.
         self._pause_pushes()
